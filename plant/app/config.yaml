@@ -1,0 +1,11 @@
+plant:
+  bind_address: "tcp://0.0.0.0:5555"
+  dt: 0.002
+  max_steps: 100000
+  log_file: "/app/logs/plant_log.csv"
+
+simulation:
+  mass: 1.0
+  gravity: -9.81
+  initial_position: [0.0, 0.0, 0.0]
+  initial_velocity: [0.0, 0.0, 0.0]

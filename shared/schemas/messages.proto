@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package hilsim;
+
+// Request message from Numeric to Plant
+message SimulationRequest {
+  uint64 seq = 1;                    // Sequence number for synchronization
+  double t = 2;                      // Simulation time
+  repeated double u = 3;             // Control input vector [3 elements for 3DOF]
+  
+  // Future extensions
+  optional string frame_id = 10;     // Coordinate frame identifier
+  optional uint64 timestamp_ns = 11; // High-resolution timestamp
+}
+
+// Response message from Plant to Numeric
+message SimulationResponse {
+  uint64 seq = 1;                    // Matching sequence number
+  double t = 2;                      // Plant simulation time
+  SensorData y = 3;                  // Sensor measurements
+  bool valid = 4;                    // Validity flag
+  
+  // Future extensions
+  optional string frame_id = 10;     // Coordinate frame identifier
+  optional uint64 timestamp_ns = 11; // High-resolution timestamp
+  optional uint32 fault_code = 12;   // Error/fault indicator
+}
+
+// Sensor data structure
+message SensorData {
+  repeated double acc = 1;           // Accelerometer [x, y, z] in m/s²
+  repeated double gyro = 2;          // Gyroscope [x, y, z] in rad/s
+  repeated double position = 3;      // Position [x, y, z] in m
+  repeated double velocity = 4;      // Velocity [x, y, z] in m/s
+  
+  // Future sensor extensions
+  repeated double magnetometer = 10; // Magnetometer [x, y, z]
+  repeated double pressure = 11;     // Pressure sensors
+  repeated double temperature = 12;  // Temperature sensors
+}
+
+// Service definition for gRPC (future use)
+service HILSSimulation {
+  rpc Step(SimulationRequest) returns (SimulationResponse);
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+  rpc Reset(ResetRequest) returns (ResetResponse);
+}
+
+message StatusRequest {}
+message StatusResponse {
+  bool running = 1;
+  uint64 total_steps = 2;
+  double sim_time = 3;
+  double real_time_factor = 4;
+}
+
+message ResetRequest {
+  repeated double initial_state = 1;
+}
+message ResetResponse {
+  bool success = 1;
+}

@@ -1,0 +1,74 @@
+
+services:
+  plant:
+    build: ../plant
+    container_name: hils-plant
+    user: "1000:1000"
+    networks: 
+      - hilsnet
+    ports:
+      - "5555:5555"
+    environment:
+      - PLANT_BIND=${PLANT_BIND}
+      - STEP_DT=${STEP_DT}
+      - RUN_ID=${RUN_ID}
+    volumes:
+      - ../logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 5555)); print('OK')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  numeric:
+    build: ../numeric
+    container_name: hils-numeric
+    user: "1000:1000"
+    depends_on:
+      plant:
+        condition: service_healthy
+    networks:
+      - hilsnet
+    environment:
+      - PLANT_ENDPOINT=${PLANT_ENDPOINT}
+      - STEP_DT=${STEP_DT}
+      - MAX_STEPS=${MAX_STEPS}
+      - RUN_ID=${RUN_ID}
+    volumes:
+      - ../logs:/app/logs
+      - ../shared:/app/shared:ro
+    restart: unless-stopped
+
+networks:
+  hilsnet:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1500
+
+# Optional: For low-latency mode, uncomment the lines below and comment out the bridge network
+# # services:
+#   plant:
+#     build: ../plant
+#     container_name: hils-plant
+#     network_mode: host
+#     environment:
+#       - PLANT_BIND=tcp://0.0.0.0:5555
+#       - STEP_DT=${STEP_DT}
+#     volumes:
+#       - ../logs:/app/logs
+#
+#   numeric:
+#     build: ../numeric  
+#     container_name: hils-numeric
+#     network_mode: host
+#     depends_on:
+#       - plant
+#     environment:
+#       - PLANT_ENDPOINT=tcp://127.0.0.1:5555
+#       - STEP_DT=${STEP_DT}
+#       - MAX_STEPS=${MAX_STEPS}
+#     volumes:
+#       - ../logs:/app/logs
+#       - ../shared:/app/shared:ro
