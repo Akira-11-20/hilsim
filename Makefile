@@ -22,7 +22,9 @@ up:
 	RUN_ID=$$RUN_ID docker compose -f docker/compose.yaml up -d
 	@echo "Waiting for services to be ready..."
 	@sleep 5
-	@$(MAKE) status
+	@docker inspect hils-plant --format='Plant: {{.State.Health.Status}}' 2>/dev/null >/dev/null && \
+	echo "✅ HILS simulation started successfully!" || \
+	echo "❌ Failed to start HILS simulation"
 
 # Stop the HILS simulation
 down:
@@ -47,7 +49,7 @@ status:
 	docker compose -f docker/compose.yaml ps
 	@echo ""
 	@echo "=== Health Checks ==="
-	docker inspect hils-plant --format='{{.State.Health.Status}}' 2>/dev/null || echo "Plant: Not running"
+	@docker inspect hils-plant --format='Plant: {{.State.Health.Status}}' 2>/dev/null || echo "Plant: Not running"
 	@echo ""
 	@echo "=== Log Files ==="
 	@ls -la logs/ 2>/dev/null || echo "No logs directory found"

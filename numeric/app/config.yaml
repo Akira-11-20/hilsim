@@ -14,4 +14,4 @@ controller:
 
 scenario:
   file: "/app/shared/scenarios/default.csv"
-  enabled: true
+  enabled: false
