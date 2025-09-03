@@ -1,5 +1,14 @@
 .PHONY: build up down logs clean status test help
 
+# Python path - tries virtual env first, fallback to system python3
+PYTHON := $(shell which python3 2>/dev/null || echo python3)
+
+# Setup Python dependencies
+setup:
+	@echo "Installing Python dependencies..."
+	$(PYTHON) -m pip install -r requirements.txt
+	@echo "Dependencies installed."
+
 # Build all Docker images
 build:
 	@echo "Building HILS Docker containers..."
@@ -94,28 +103,20 @@ monitor:
 # Integrated log management and visualization
 analyze:
 	@echo "Running HILS analysis..."
-	$(shell which python3) scripts/hils_analyzer.py visualize
+	$(PYTHON) scripts/hils_analyzer.py visualize
 	@echo "Analysis complete."
 
 # Show log status
 logs-status:
-	$(shell which python3) scripts/hils_analyzer.py status
+	$(PYTHON) scripts/hils_analyzer.py status
 
-# Archive current logs
-archive:
-	@echo "Archiving current logs..."
-	python3 scripts/hils_analyzer.py archive --tag "$(shell date +%Y%m%d_%H%M%S)"
-	@echo "Archive complete."
-
-# Clean old archives
-clean-archives:
-	python3 scripts/hils_analyzer.py clean
 
 
 # Show help
 help:
 	@echo "HILS Simulation Makefile Commands:"
 	@echo ""
+	@echo "  setup     - Install Python dependencies"
 	@echo "  build     - Build all Docker containers"
 	@echo "  up        - Start the HILS simulation"
 	@echo "  down      - Stop the HILS simulation"  
@@ -132,8 +133,6 @@ help:
 	@echo ""
 	@echo "  analyze   - Run integrated log analysis and visualization"
 	@echo "  logs-status - Show current log file status"
-	@echo "  archive   - Archive current logs with timestamp"
-	@echo "  clean-archives - Remove old archived logs"
 	@echo ""
 	@echo "  clean     - Clean up all Docker resources"
 	@echo ""

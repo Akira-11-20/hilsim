@@ -17,16 +17,12 @@ import matplotlib.patches as patches
 from pathlib import Path
 
 class HILSAnalyzer:
-    def __init__(self, log_dir="logs", archive_dir="logs_archive"):
+    def __init__(self, log_dir="logs"):
         self.log_dir = Path(log_dir)
-        self.archive_dir = Path(archive_dir)
         self.config_file = Path("hils_analyzer_config.json")
         
         # Default configuration
         self.config = {
-            "log_retention_days": 30,
-            "auto_archive": True,
-            "max_log_size_mb": 100,
             "visualization_dpi": 300,
             "default_plots": ["dashboard", "trajectory", "performance"],
             "colors": {
@@ -62,7 +58,6 @@ class HILSAnalyzer:
     def ensure_directories(self):
         """Create necessary directories"""
         self.log_dir.mkdir(exist_ok=True)
-        self.archive_dir.mkdir(exist_ok=True)
         
     def get_latest_run_dir(self):
         """Get the latest run directory"""
@@ -77,9 +72,15 @@ class HILSAnalyzer:
         # Return the most recent one
         return max(run_dirs, key=lambda x: x.name)
     
-    def get_log_files(self, run_dir=None):
+    def get_log_files(self, run_dir=None, run_id=None):
         """Get list of log files from specific run directory or latest"""
-        if run_dir is None:
+        if run_id:
+            # Use specific run ID
+            run_dir = self.log_dir / run_id
+            if not run_dir.exists():
+                print(f"Run ID {run_id} not found")
+                return {}
+        elif run_dir is None:
             run_dir = self.get_latest_run_dir()
             
         if run_dir is None:
@@ -114,62 +115,10 @@ class HILSAnalyzer:
                 
         return info
         
-    def archive_logs(self, tag=None):
-        """Archive current log files"""
-        if not self.log_dir.exists() or not any(self.log_dir.glob("*.csv")):
-            print("No log files to archive")
-            return
             
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if tag:
-            archive_name = f"logs_{timestamp}_{tag}"
-        else:
-            archive_name = f"logs_{timestamp}"
-            
-        archive_path = self.archive_dir / archive_name
-        archive_path.mkdir(exist_ok=True)
-        
-        # Move log files
-        archived_files = []
-        for log_file in self.log_dir.glob("*.csv"):
-            dest = archive_path / log_file.name
-            shutil.move(str(log_file), str(dest))
-            archived_files.append(log_file.name)
-            
-        # Move PNG files from latest run directory if they exist
-        run_dir = self.get_latest_run_dir()
-        if run_dir:
-            for png_file in run_dir.glob("hils_*.png"):
-                dest = archive_path / png_file.name
-                shutil.move(str(png_file), str(dest))
-            archived_files.append(png_file.name)
-            
-        print(f"Archived {len(archived_files)} files to {archive_path}")
-        return archive_path
-        
-    def clean_old_archives(self):
-        """Remove old archived logs based on retention policy"""
-        cutoff_date = datetime.datetime.now() - datetime.timedelta(
-            days=self.config['log_retention_days']
-        )
-        
-        removed_count = 0
-        for archive_dir in self.archive_dir.glob("logs_*"):
-            if archive_dir.is_dir():
-                dir_time = datetime.datetime.fromtimestamp(archive_dir.stat().st_mtime)
-                if dir_time < cutoff_date:
-                    shutil.rmtree(archive_dir)
-                    removed_count += 1
-                    print(f"Removed old archive: {archive_dir.name}")
-                    
-        if removed_count == 0:
-            print("No old archives to remove")
-        else:
-            print(f"Removed {removed_count} old archives")
-            
-    def load_simulation_data(self):
+    def load_simulation_data(self, run_id=None):
         """Load and validate simulation data"""
-        log_files = self.get_log_files()
+        log_files = self.get_log_files(run_id=run_id)
         
         if 'numeric' not in log_files:
             raise FileNotFoundError("numeric_log.csv not found")
@@ -449,22 +398,27 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
         plt.tight_layout()
         return fig
         
-    def generate_visualizations(self, plots=None):
+    def generate_visualizations(self, plots=None, run_id=None):
         """Generate all requested visualizations"""
         if plots is None:
             plots = self.config['default_plots']
             
-        if not self.load_simulation_data():
+        if not self.load_simulation_data(run_id=run_id):
             return False
             
         generated_files = []
         dpi = self.config['visualization_dpi']
         
+        # Determine target directory
+        if run_id:
+            target_dir = self.log_dir / run_id
+        else:
+            target_dir = self.get_latest_run_dir()
+        
         if 'dashboard' in plots:
             print("Generating comprehensive dashboard...")
             fig = self.create_dashboard()
-            run_dir = self.get_latest_run_dir()
-            filename = run_dir / 'hils_analysis_dashboard.png' if run_dir else 'hils_analysis_dashboard.png'
+            filename = target_dir / 'hils_analysis_dashboard.png' if target_dir else 'hils_analysis_dashboard.png'
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
             generated_files.append(str(filename))
             plt.close(fig)
@@ -472,8 +426,7 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
         if 'trajectory' in plots:
             print("Generating 3D trajectory...")
             fig = self.create_trajectory_3d()
-            run_dir = self.get_latest_run_dir()
-            filename = run_dir / 'hils_flight_trajectory.png' if run_dir else 'hils_flight_trajectory.png'
+            filename = target_dir / 'hils_flight_trajectory.png' if target_dir else 'hils_flight_trajectory.png'
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
             generated_files.append(str(filename))
             plt.close(fig)
@@ -481,8 +434,7 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
         if 'performance' in plots:
             print("Generating performance report...")
             fig = self.create_performance_report()
-            run_dir = self.get_latest_run_dir()
-            filename = run_dir / 'hils_performance_report.png' if run_dir else 'hils_performance_report.png'
+            filename = target_dir / 'hils_performance_report.png' if target_dir else 'hils_performance_report.png'
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
             generated_files.append(str(filename))
             plt.close(fig)
@@ -508,13 +460,6 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
             print(f"  Lines: {details['lines']}")
             print(f"  Modified: {details['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
             
-        # Archive information
-        archives = list(self.archive_dir.glob("logs_*"))
-        print(f"\nARCHIVES: {len(archives)} archived sessions")
-        if archives:
-            latest = max(archives, key=lambda x: x.stat().st_mtime)
-            print(f"  Latest: {latest.name}")
-            
         print("="*60)
 
 def main():
@@ -526,9 +471,8 @@ Examples:
   %(prog)s status                 - Show log status
   %(prog)s visualize             - Generate all visualizations
   %(prog)s visualize --plots dashboard trajectory - Generate specific plots
-  %(prog)s archive --tag test1   - Archive logs with tag
-  %(prog)s clean                 - Clean old archives
-  %(prog)s config --retention 7  - Set log retention to 7 days
+  %(prog)s visualize --run-id 20250903_211154 - Analyze specific run
+  %(prog)s config --dpi 150      - Set visualization DPI to 150
         """
     )
     
@@ -543,13 +487,8 @@ Examples:
                            choices=['dashboard', 'trajectory', 'performance'],
                            help='Specific plots to generate')
     viz_parser.add_argument('--show', action='store_true', help='Show plots after generation')
+    viz_parser.add_argument('--run-id', help='Specific run ID to analyze (e.g., 20250903_211154)')
     
-    # Archive command
-    archive_parser = subparsers.add_parser('archive', help='Archive current logs')
-    archive_parser.add_argument('--tag', help='Tag for the archive')
-    
-    # Clean command
-    clean_parser = subparsers.add_parser('clean', help='Clean old archives')
     
     # Config command
     config_parser = subparsers.add_parser('config', help='Manage configuration')
@@ -570,7 +509,8 @@ Examples:
         
     elif args.command == 'visualize':
         plots = args.plots if args.plots else None
-        files = analyzer.generate_visualizations(plots)
+        run_id = getattr(args, 'run_id', None)
+        files = analyzer.generate_visualizations(plots, run_id=run_id)
         if args.show and files:
             import subprocess
             for f in files:
@@ -580,13 +520,6 @@ Examples:
                     except:
                         print(f"Generated: {f}")
                         
-    elif args.command == 'archive':
-        archive_path = analyzer.archive_logs(args.tag)
-        if archive_path:
-            print(f"Logs archived to: {archive_path}")
-            
-    elif args.command == 'clean':
-        analyzer.clean_old_archives()
         
     elif args.command == 'config':
         if args.retention:
