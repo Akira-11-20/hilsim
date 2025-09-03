@@ -1,5 +1,6 @@
-# Logs and data files
-logs/
+# Log contents but keep directory structure
+logs/*
+!logs/.gitkeep
 *.log
 *.csv
 
