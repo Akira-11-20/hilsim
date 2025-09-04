@@ -1,17 +1,17 @@
 numeric:
   plant_endpoint: "tcp://plant:5555"
-  dt: 0.002
-  max_steps: 1000
+  dt: 0.01
+  max_steps: 2000  # 20 second long test
   timeout_ms: 5000
   log_file: "/app/logs/numeric_log.csv"
 
 controller:
   type: "pid"
-  kp: 1.0
-  ki: 0.1
-  kd: 0.01
-  setpoint: [0.0, 0.0, 10.0]  # Target position (hover at 10m height)
+  kp: 18.0     # Aggressive proportional gain - proven optimal
+  ki: 2.5      # Strong integral term for steady-state error elimination  
+  kd: 10.0     # Strong derivative damping for overshoot control
+  setpoint: 10.0  # Target altitude [m]
 
 scenario:
   file: "/app/shared/scenarios/default.csv"
-  enabled: false
+  enabled: false  # Use PID mode for simplified altitude control

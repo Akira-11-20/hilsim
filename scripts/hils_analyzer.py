@@ -147,10 +147,11 @@ class HILSAnalyzer:
         
         # Data preparation
         t = self.numeric_data['t'].values
-        altitude = self.numeric_data['pos_z'].values
-        cmd_z = self.numeric_data['cmd_z'].values
-        vel_z = self.numeric_data['vel_z'].values
-        error = self.numeric_data['error_z'].values
+        altitude = self.numeric_data['altitude'].values
+        thrust_cmd = self.numeric_data['thrust_cmd'].values
+        velocity = self.numeric_data['velocity'].values
+        altitude_error = self.numeric_data['altitude_error'].values
+        setpoint = self.numeric_data['setpoint'].values
         rtt = self.numeric_data['rtt_ms'].values
         
         colors = self.config['colors']
@@ -158,8 +159,8 @@ class HILSAnalyzer:
         # 1. Altitude Control (main plot)
         ax1 = fig.add_subplot(gs[0, :2])
         ax1.plot(t, altitude, color=colors['primary'], linewidth=2.5, label='Actual Altitude')
-        ax1.axhline(y=10.0, color=colors['danger'], linestyle='--', linewidth=2, label='Target (10m)')
-        ax1.fill_between(t, altitude, 10, where=(altitude < 10), alpha=0.3, 
+        ax1.plot(t, setpoint, color=colors['danger'], linestyle='--', linewidth=2, label='Setpoint')
+        ax1.fill_between(t, altitude, setpoint, where=(altitude < setpoint), alpha=0.3, 
                         color=colors['danger'], label='Below Target')
         ax1.set_xlabel('Time [s]')
         ax1.set_ylabel('Altitude [m]')
@@ -167,22 +168,22 @@ class HILSAnalyzer:
         ax1.legend()
         ax1.grid(True, alpha=0.3)
         
-        # 2. Control Commands
+        # 2. Control Commands (Thrust)
         ax2 = fig.add_subplot(gs[0, 2])
-        ax2.plot(t, cmd_z, color=colors['success'], linewidth=2)
-        ax2.axhline(y=9.81, color='gray', linestyle=':', linewidth=2, label='Gravity')
+        ax2.plot(t, thrust_cmd, color=colors['success'], linewidth=2)
+        ax2.axhline(y=9.81, color='gray', linestyle=':', linewidth=2, label='Gravity Compensation')
         ax2.set_xlabel('Time [s]')
         ax2.set_ylabel('Thrust [N]')
-        ax2.set_title('Control Commands', fontweight='bold')
+        ax2.set_title('Thrust Commands', fontweight='bold')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
         
         # 3. Velocity Profile
         ax3 = fig.add_subplot(gs[1, 0])
-        ax3.plot(t, vel_z, color=colors['warning'], linewidth=2)
+        ax3.plot(t, velocity, color=colors['warning'], linewidth=2)
         ax3.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-        ax3.fill_between(t, vel_z, 0, where=(vel_z > 0), alpha=0.5, color='blue', label='Up')
-        ax3.fill_between(t, vel_z, 0, where=(vel_z < 0), alpha=0.5, color='red', label='Down')
+        ax3.fill_between(t, velocity, 0, where=(velocity > 0), alpha=0.5, color='blue', label='Up')
+        ax3.fill_between(t, velocity, 0, where=(velocity < 0), alpha=0.5, color='red', label='Down')
         ax3.set_xlabel('Time [s]')
         ax3.set_ylabel('Velocity [m/s]')
         ax3.set_title('Vertical Velocity', fontweight='bold')
@@ -191,15 +192,15 @@ class HILSAnalyzer:
         
         # 4. Error Analysis
         ax4 = fig.add_subplot(gs[1, 1])
-        ax4.plot(t, np.abs(error), color=colors['danger'], linewidth=2)
+        ax4.plot(t, np.abs(altitude_error), color=colors['danger'], linewidth=2)
         ax4.set_xlabel('Time [s]')
         ax4.set_ylabel('|Error| [m]')
         ax4.set_title('Control Error', fontweight='bold')
         ax4.grid(True, alpha=0.3)
         
         # Error statistics
-        mean_error = np.mean(np.abs(error))
-        ax4.text(0.05, 0.95, f'Mean: {mean_error:.2f}m\nFinal: {np.abs(error[-1]):.2f}m', 
+        mean_error = np.mean(np.abs(altitude_error))
+        ax4.text(0.05, 0.95, f'Mean: {mean_error:.2f}m\nFinal: {np.abs(altitude_error[-1]):.2f}m', 
                 transform=ax4.transAxes, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
         
@@ -220,7 +221,7 @@ class HILSAnalyzer:
         
         # 6. Phase Portrait
         ax6 = fig.add_subplot(gs[2, 0])
-        scatter = ax6.scatter(altitude, vel_z, c=t, cmap='viridis', s=15, alpha=0.6)
+        scatter = ax6.scatter(altitude, velocity, c=t, cmap='viridis', s=15, alpha=0.6)
         ax6.set_xlabel('Altitude [m]')
         ax6.set_ylabel('Velocity [m/s]')
         ax6.set_title('Phase Portrait', fontweight='bold')
@@ -228,7 +229,7 @@ class HILSAnalyzer:
         
         # 7. Control Effort
         ax7 = fig.add_subplot(gs[2, 1])
-        control_effort = cmd_z - 9.81
+        control_effort = thrust_cmd - 9.81
         ax7.plot(t, control_effort, color=colors['secondary'], linewidth=2)
         ax7.axhline(y=0, color='black', linestyle='-', alpha=0.5)
         ax7.fill_between(t, control_effort, 0, alpha=0.3, color=colors['secondary'])
@@ -245,9 +246,9 @@ class HILSAnalyzer:
         metrics = [
             f"Simulation: {t[-1]:.2f}s ({len(t)} steps)",
             f"Final Alt: {altitude[-1]:.2f}m (target: 10m)",
-            f"Alt Error: {error[-1]:.2f}m",
-            f"Max Speed: {np.max(np.abs(vel_z)):.2f}m/s", 
-            f"Thrust Range: {np.min(cmd_z):.1f}-{np.max(cmd_z):.1f}N",
+            f"Alt Error: {altitude_error[-1]:.2f}m",
+            f"Max Speed: {np.max(np.abs(velocity)):.2f}m/s", 
+            f"Thrust Range: {np.min(thrust_cmd):.1f}-{np.max(thrust_cmd):.1f}N",
             f"Comm: {mean_rtt:.2f}±{std_rtt:.2f}ms",
             f"Success Rate: 100%"
         ]
@@ -262,32 +263,28 @@ class HILSAnalyzer:
         return fig
         
     def create_trajectory_3d(self):
-        """Create 3D trajectory visualization"""
+        """Create 1D altitude trajectory visualization"""
         fig = plt.figure(figsize=(12, 9))
-        ax = fig.add_subplot(111, projection='3d')
+        ax = fig.add_subplot(111)
         
-        x = self.numeric_data['pos_x'].values
-        y = self.numeric_data['pos_y'].values
-        z = self.numeric_data['pos_z'].values
+        altitude = self.numeric_data['altitude'].values
         t = self.numeric_data['t'].values
+        setpoint = self.numeric_data['setpoint'].values[0]  # Constant setpoint
         
-        # Plot trajectory
-        scatter = ax.scatter(x, y, z, c=t, cmap='plasma', s=25, alpha=0.8)
+        # Plot altitude trajectory over time
+        ax.plot(t, altitude, linewidth=3, label='Actual Altitude', color='blue')
+        ax.axhline(y=setpoint, color='red', linestyle='--', linewidth=2, label=f'Target ({setpoint}m)')
         
         # Mark important points
-        ax.scatter([x[0]], [y[0]], [z[0]], color='green', s=150, marker='o', label='Start')
-        ax.scatter([x[-1]], [y[-1]], [z[-1]], color='red', s=150, marker='s', label='End')
-        ax.scatter([0], [0], [10], color='gold', s=300, marker='*', label='Target (0,0,10m)')
+        ax.scatter([t[0]], [altitude[0]], color='green', s=150, marker='o', label='Start')
+        ax.scatter([t[-1]], [altitude[-1]], color='red', s=150, marker='s', label='End')
         
-        # Add colorbar
-        cbar = plt.colorbar(scatter, ax=ax, shrink=0.8, aspect=20)
-        cbar.set_label('Time [s]', fontsize=12)
-        
-        ax.set_xlabel('X Position [m]', fontsize=12)
-        ax.set_ylabel('Y Position [m]', fontsize=12)
-        ax.set_zlabel('Z Altitude [m]', fontsize=12)
-        ax.set_title('HILS 3D Flight Trajectory', fontsize=16, fontweight='bold')
+        # Formatting
+        ax.set_xlabel('Time [s]')
+        ax.set_ylabel('Altitude [m]')
+        ax.set_title('Altitude Control Trajectory', fontsize=16, fontweight='bold')
         ax.legend()
+        ax.grid(True, alpha=0.3)
         
         return fig
         
@@ -297,10 +294,10 @@ class HILSAnalyzer:
         fig.suptitle('HILS Performance Analysis Report', fontsize=16, fontweight='bold')
         
         t = self.numeric_data['t'].values
-        altitude = self.numeric_data['pos_z'].values
-        cmd_z = self.numeric_data['cmd_z'].values
-        vel_z = self.numeric_data['vel_z'].values
-        error = self.numeric_data['error_z'].values
+        altitude = self.numeric_data['altitude'].values
+        thrust_cmd = self.numeric_data['thrust_cmd'].values
+        velocity = self.numeric_data['velocity'].values
+        altitude_error = self.numeric_data['altitude_error'].values
         rtt = self.numeric_data['rtt_ms'].values
         
         # 1. Altitude tracking
@@ -312,7 +309,7 @@ class HILSAnalyzer:
         axes[0,0].grid(True, alpha=0.3)
         
         # 2. Control signal
-        axes[0,1].plot(t, cmd_z, 'g-', linewidth=2)
+        axes[0,1].plot(t, thrust_cmd, 'g-', linewidth=2)
         axes[0,1].axhline(9.81, color='gray', linestyle=':', label='Gravity')
         axes[0,1].set_title('Control Signal')
         axes[0,1].set_ylabel('Thrust [N]')
@@ -320,7 +317,7 @@ class HILSAnalyzer:
         axes[0,1].grid(True, alpha=0.3)
         
         # 3. Error histogram
-        axes[0,2].hist(error, bins=30, alpha=0.7, color='orange', edgecolor='black')
+        axes[0,2].hist(altitude_error, bins=30, alpha=0.7, color='orange', edgecolor='black')
         axes[0,2].axvline(0, color='red', linestyle='--')
         axes[0,2].set_title('Error Distribution')
         axes[0,2].set_xlabel('Error [m]')
@@ -328,7 +325,7 @@ class HILSAnalyzer:
         axes[0,2].grid(True, alpha=0.3)
         
         # 4. Velocity vs time
-        axes[1,0].plot(t, vel_z, 'purple', linewidth=2)
+        axes[1,0].plot(t, velocity, 'purple', linewidth=2)
         axes[1,0].axhline(0, color='black', alpha=0.5)
         axes[1,0].set_title('Velocity Profile')
         axes[1,0].set_xlabel('Time [s]')
@@ -347,7 +344,7 @@ class HILSAnalyzer:
         
         # Calculate performance metrics
         settling_time = None
-        steady_state_error = np.mean(np.abs(error[-100:]))  # Last 100 points
+        steady_state_error = np.mean(np.abs(altitude_error[-100:]))  # Last 100 points
         overshoot = np.max(altitude) - 10 if np.max(altitude) > 10 else 0
         rise_time = None
         

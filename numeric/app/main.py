@@ -14,32 +14,56 @@ from typing import Dict, List, Optional
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class PIDController:
-    def __init__(self, kp: float, ki: float, kd: float, setpoint: List[float]):
+class AltitudePIDController:
+    """動作確認済みのPID制御器 - simple_pid_control/から移植"""
+    
+    def __init__(self, kp: float, ki: float, kd: float, setpoint: float):
         self.kp = kp
         self.ki = ki
         self.kd = kd
-        self.setpoint = np.array(setpoint, dtype=np.float64)
+        self.setpoint = float(setpoint)  # Target altitude [m]
         
-        self.error_sum = np.zeros(3)
-        self.prev_error = np.zeros(3)
+        self.error_sum = 0.0
+        self.prev_error = None
         self.prev_time = None
         
-    def update(self, current_pos: np.ndarray, dt: float) -> np.ndarray:
-        error = self.setpoint - current_pos
+        # 積分項のwindup防止
+        self.integral_limit = 30.0
         
-        if self.prev_time is None:
+    def reset(self):
+        """制御器状態をリセット"""
+        self.error_sum = 0.0
+        self.prev_error = None
+        self.prev_time = None
+        
+    def update(self, measurement: float, dt: float) -> float:
+        """PID制御器の更新"""
+        error = self.setpoint - measurement
+        
+        # 初回呼び出し時の初期化
+        if self.prev_error is None:
             self.prev_error = error
             
-        # PID calculation
+        # 比例項
+        p_term = self.kp * error
+        
+        # 積分項（windup防止付き）
         self.error_sum += error * dt
-        error_diff = (error - self.prev_error) / dt if dt > 0 else np.zeros(3)
+        self.error_sum = np.clip(self.error_sum, -self.integral_limit, self.integral_limit)
+        i_term = self.ki * self.error_sum
         
-        output = (self.kp * error + 
-                 self.ki * self.error_sum + 
-                 self.kd * error_diff)
+        # 微分項
+        if dt > 0:
+            d_term = self.kd * (error - self.prev_error) / dt
+        else:
+            d_term = 0.0
+            
+        # PID出力
+        output = p_term + i_term + d_term
         
+        # 次回のために保存
         self.prev_error = error
+        
         return output
 
 class NumericSimulator:
@@ -75,11 +99,11 @@ class NumericSimulator:
         
     def setup_controller(self):
         ctrl_config = self.config['controller']
-        self.controller = PIDController(
+        self.controller = AltitudePIDController(
             kp=ctrl_config['kp'],
             ki=ctrl_config['ki'], 
             kd=ctrl_config['kd'],
-            setpoint=ctrl_config['setpoint']
+            setpoint=ctrl_config['setpoint']  # Single altitude setpoint
         )
         
     def setup_logging(self):
@@ -87,12 +111,8 @@ class NumericSimulator:
         self.log_fp = open(self.log_file, 'w', newline='')
         self.csv_writer = csv.writer(self.log_fp)
         self.csv_writer.writerow(['seq', 't', 'send_time', 'recv_time', 'rtt_ms',
-                                 'cmd_x', 'cmd_y', 'cmd_z',
-                                 'pos_x', 'pos_y', 'pos_z', 
-                                 'vel_x', 'vel_y', 'vel_z',
-                                 'acc_x', 'acc_y', 'acc_z',
-                                 'gyro_x', 'gyro_y', 'gyro_z',
-                                 'error_x', 'error_y', 'error_z'])
+                                 'thrust_cmd', 'altitude', 'velocity', 'acceleration',
+                                 'altitude_error', 'setpoint'])
     
     def load_scenario(self):
         self.scenario = None
@@ -103,15 +123,45 @@ class NumericSimulator:
                 self.scenario = pd.read_csv(scenario_file)
                 logger.info(f"Loaded scenario from {scenario_file}")
     
-    def get_command(self, step: int, current_pos: np.ndarray) -> np.ndarray:
-        """Generate control command"""
-        if self.scenario is not None and step < len(self.scenario):
-            # Use predefined scenario
-            row = self.scenario.iloc[step]
-            return np.array([row.get('cmd_x', 0.0), row.get('cmd_y', 0.0), row.get('cmd_z', 0.0)])
-        else:
-            # Use PID controller
-            return self.controller.update(current_pos, self.dt)
+    def get_command(self, step: int, current_altitude: float) -> List[float]:
+        """Generate thrust command for altitude control - simplified"""
+        # 質量は設定から取得（通常は1.0kg）
+        mass = 1.0  # または self.config から取得可能
+        gravity = 9.81
+        
+        if self.scenario is not None:
+            # Find the appropriate scenario command for this step
+            scenario_row = None
+            for _, row in self.scenario.iterrows():
+                if row['step'] <= step:
+                    scenario_row = row
+                else:
+                    break
+            
+            if scenario_row is not None:
+                cmd_type = scenario_row.get('cmd_type', 'position')
+                cmd_z = scenario_row.get('cmd_z', 10.0)  # Default altitude
+                
+                if cmd_type == 'force':
+                    # Direct thrust command
+                    thrust = cmd_z
+                    return [0.0, 0.0, thrust]
+                else:  # cmd_type == 'position' or default
+                    # Altitude setpoint command - use PID controller
+                    self.controller.setpoint = cmd_z
+                    pid_output = self.controller.update(current_altitude, self.dt)
+                    thrust = pid_output + mass * gravity  # 正しい重力補償
+                    return [0.0, 0.0, thrust]
+        
+        # Default: PID controller with proper gravity compensation
+        pid_output = self.controller.update(current_altitude, self.dt)
+        thrust = pid_output + mass * gravity  # mg分の重力補償
+        
+        # 推力制限（現実的な範囲）
+        max_thrust = 50.0  # 最大推力 [N]
+        thrust = np.clip(thrust, 0, max_thrust)
+        
+        return [0.0, 0.0, thrust]
     
     def send_receive(self, seq: int, t: float, command: List[float]) -> Optional[Dict]:
         """Send command and receive response"""
@@ -148,18 +198,18 @@ class NumericSimulator:
         logger.info(f"Numeric simulator started, will run {self.max_steps} steps")
         
         # State tracking
-        current_pos = np.zeros(3)
+        current_altitude = 0.0
         sim_time = 0.0
         successful_steps = 0
         failed_steps = 0
         
         try:
             for step in range(self.max_steps):
-                # Generate control command
-                command = self.get_command(step, current_pos)
+                # Generate control command (thrust)
+                command = self.get_command(step, current_altitude)
                 
                 # Communication with plant
-                result = self.send_receive(step, sim_time, command.tolist())
+                result = self.send_receive(step, sim_time, command)
                 
                 if result is None:
                     failed_steps += 1
@@ -175,27 +225,25 @@ class NumericSimulator:
                     continue
                 
                 y = response['y']
-                plant_pos = np.array(y.get('position', [0.0, 0.0, 0.0]))
-                plant_vel = np.array(y.get('velocity', [0.0, 0.0, 0.0]))
-                plant_acc = np.array(y.get('acc', [0.0, 0.0, 0.0]))
-                plant_gyro = np.array(y.get('gyro', [0.0, 0.0, 0.0]))
+                plant_pos = y.get('position', [0.0, 0.0, 0.0])
+                plant_vel = y.get('velocity', [0.0, 0.0, 0.0])
+                plant_acc = y.get('acc', [0.0, 0.0, 0.0])
                 
-                # Update state for next iteration
-                current_pos = plant_pos
+                # Extract altitude (Z-axis)
+                current_altitude = plant_pos[2]
+                current_velocity = plant_vel[2]
+                current_acceleration = plant_acc[2]
                 
-                # Calculate error
-                error = self.controller.setpoint - current_pos
+                # Calculate altitude error
+                altitude_error = self.controller.setpoint - current_altitude
                 
                 # Log data
                 if self.csv_writer:
                     self.csv_writer.writerow([
                         step, sim_time, result['send_time'], result['recv_time'], result['rtt_ms'],
-                        command[0], command[1], command[2],
-                        plant_pos[0], plant_pos[1], plant_pos[2],
-                        plant_vel[0], plant_vel[1], plant_vel[2],
-                        plant_acc[0], plant_acc[1], plant_acc[2],
-                        plant_gyro[0], plant_gyro[1], plant_gyro[2],
-                        error[0], error[1], error[2]
+                        command[2],  # thrust_cmd
+                        current_altitude, current_velocity, current_acceleration,
+                        altitude_error, self.controller.setpoint
                     ])
                     self.log_fp.flush()
                 
