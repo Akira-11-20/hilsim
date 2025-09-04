@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-最適化されたPID制御シミュレーション - 複数のパラメータセットをテスト
+オーバーシュート抑制に特化したPID制御シミュレーション
 """
 
 import numpy as np
@@ -61,6 +61,70 @@ class SimplePIDController:
         return output
 
 
+class AntiOvershootPIDController:
+    """オーバーシュート抑制PID制御器"""
+    
+    def __init__(self, kp: float, ki: float, kd: float, setpoint: float):
+        self.kp = kp
+        self.ki = ki  
+        self.kd = kd
+        self.setpoint = setpoint
+        
+        self.error_sum = 0.0
+        self.prev_error = None
+        self.prev_time = None
+        
+        # 積分項のwindup防止
+        self.integral_limit = 20.0
+        
+        # オーバーシュート抑制のための設定
+        self.overshoot_threshold = 0.1  # 目標値の10%以内に近づいたら積分を停止
+        self.derivative_kick_prevention = True  # 微分キック防止
+        
+    def reset(self):
+        """制御器状態をリセット"""
+        self.error_sum = 0.0
+        self.prev_error = None
+        self.prev_time = None
+        
+    def update(self, measurement: float, dt: float) -> float:
+        """オーバーシュート抑制PID制御器の更新"""
+        error = self.setpoint - measurement
+        
+        # 初回呼び出し時の初期化
+        if self.prev_error is None:
+            self.prev_error = error
+            
+        # 比例項
+        p_term = self.kp * error
+        
+        # 積分項（オーバーシュート近くでは積分を停止）
+        if abs(error) > self.overshoot_threshold * self.setpoint:
+            self.error_sum += error * dt
+            self.error_sum = np.clip(self.error_sum, -self.integral_limit, self.integral_limit)
+        # 目標値に近づいたら積分を凍結してオーバーシュートを防ぐ
+        
+        i_term = self.ki * self.error_sum
+        
+        # 微分項（微分キック防止）
+        if dt > 0:
+            if self.derivative_kick_prevention:
+                # 測定値の変化に対してのみ微分を適用（setpoint変化による微分キック防止）
+                d_term = -self.kd * (measurement - (self.setpoint - self.prev_error)) / dt
+            else:
+                d_term = self.kd * (error - self.prev_error) / dt
+        else:
+            d_term = 0.0
+            
+        # PID出力
+        output = p_term + i_term + d_term
+        
+        # 次回のために保存
+        self.prev_error = error
+        
+        return output
+
+
 class SimpleAltitudePlant:
     """シンプルな高度植物モデル（質点の1次元運動）"""
     
@@ -103,21 +167,22 @@ class SimpleAltitudePlant:
         )
 
 
-class OptimizedPIDSimulation:
-    """最適化PID制御シミュレーション"""
+class AntiOvershootSimulation:
+    """オーバーシュート抑制PID制御シミュレーション"""
     
     def __init__(self):
         # シミュレーション設定
         self.dt = 0.01  # タイムステップ [s]
-        self.sim_time = 15.0  # シミュレーション時間 [s]
+        self.sim_time = 20.0  # シミュレーション時間 [s]
         self.steps = int(self.sim_time / self.dt)
         
-        # テストするPIDパラメータセット
+        # テストするPIDパラメータセット（オーバーシュート抑制重視）
         self.pid_configs = [
-            {"name": "Conservative", "kp": 8.0, "ki": 0.5, "kd": 6.0},
-            {"name": "Balanced", "kp": 12.0, "ki": 1.5, "kd": 8.0},
-            {"name": "Aggressive", "kp": 18.0, "ki": 2.5, "kd": 10.0},
-            {"name": "Optimized", "kp": 10.0, "ki": 1.0, "kd": 7.5},  # 実験的に最適化
+            {"name": "Standard", "type": "standard", "kp": 18.0, "ki": 2.5, "kd": 10.0},
+            {"name": "Low_Overshoot_1", "type": "standard", "kp": 12.0, "ki": 1.0, "kd": 15.0},  # 高D、低K
+            {"name": "Low_Overshoot_2", "type": "standard", "kp": 8.0, "ki": 0.5, "kd": 20.0},   # さらに高D
+            {"name": "Anti_Overshoot", "type": "anti_overshoot", "kp": 15.0, "ki": 2.0, "kd": 12.0},  # 特殊制御
+            {"name": "Conservative_Plus", "type": "standard", "kp": 10.0, "ki": 0.8, "kd": 18.0}, # バランス重視
         ]
         
         self.target_altitude = 10.0  # 目標高度 [m]
@@ -125,12 +190,22 @@ class OptimizedPIDSimulation:
     def run_single_simulation(self, pid_config: Dict, verbose: bool = False) -> Dict:
         """単一のPID設定でシミュレーション実行"""
         plant = SimpleAltitudePlant(mass=1.0, gravity=9.81)
-        controller = SimplePIDController(
-            kp=pid_config["kp"],
-            ki=pid_config["ki"], 
-            kd=pid_config["kd"],
-            setpoint=self.target_altitude
-        )
+        
+        # 制御器の選択
+        if pid_config["type"] == "anti_overshoot":
+            controller = AntiOvershootPIDController(
+                kp=pid_config["kp"],
+                ki=pid_config["ki"], 
+                kd=pid_config["kd"],
+                setpoint=self.target_altitude
+            )
+        else:
+            controller = SimplePIDController(
+                kp=pid_config["kp"],
+                ki=pid_config["ki"], 
+                kd=pid_config["kd"],
+                setpoint=self.target_altitude
+            )
         
         # データ記録用
         time_data = []
@@ -171,7 +246,7 @@ class OptimizedPIDSimulation:
             current_time += self.dt
             
             # 進捗表示
-            if verbose and step % 300 == 0:
+            if verbose and step % 400 == 0:
                 print(f"[{pid_config['name']}] 時刻: {current_time:.1f}s, 高度: {measured_position:.2f}m")
         
         # 性能指標の計算
@@ -240,7 +315,7 @@ class OptimizedPIDSimulation:
         
     def run_comparison(self):
         """複数のPID設定を比較"""
-        print("=== PID制御パラメータ比較テスト ===")
+        print("=== オーバーシュート抑制PID制御パラメータ比較テスト ===")
         print(f"目標高度: {self.target_altitude} m")
         print(f"シミュレーション時間: {self.sim_time} s")
         print()
@@ -249,7 +324,8 @@ class OptimizedPIDSimulation:
         
         # 各設定でシミュレーション実行
         for config in self.pid_configs:
-            print(f"テスト中: {config['name']} (Kp={config['kp']}, Ki={config['ki']}, Kd={config['kd']})")
+            controller_type = "Anti-Overshoot" if config['type'] == 'anti_overshoot' else "Standard"
+            print(f"テスト中: {config['name']} ({controller_type}) (Kp={config['kp']}, Ki={config['ki']}, Kd={config['kd']})")
             result = self.run_single_simulation(config, verbose=False)
             results.append(result)
             perf = result['performance']
@@ -259,7 +335,7 @@ class OptimizedPIDSimulation:
         # 結果の比較プロット
         self.plot_comparison(results)
         
-        # 最適設定の推薦
+        # オーバーシュート最小の推薦
         self.recommend_best_config(results)
         
         return results
@@ -267,15 +343,16 @@ class OptimizedPIDSimulation:
     def plot_comparison(self, results: List[Dict]):
         """結果比較のプロット"""
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('PID Parameter Comparison Results', fontsize=16)
+        fig.suptitle('Anti-Overshoot PID Comparison Results', fontsize=16)
         
-        colors = ['blue', 'green', 'red', 'purple']
+        colors = ['blue', 'green', 'red', 'purple', 'orange']
         
         for i, result in enumerate(results):
             data = result['data']
             config = result['config']
             color = colors[i % len(colors)]
-            label = f"{config['name']} (Kp={config['kp']}, Ki={config['ki']}, Kd={config['kd']})"
+            ctrl_type = "AO" if config['type'] == 'anti_overshoot' else "Std"
+            label = f"{config['name']} ({ctrl_type}) - OS:{result['performance']['max_overshoot']:.2f}m"
             
             # 高度の時系列
             axes[0, 0].plot(data['time'], data['position'], color=color, label=label, linewidth=2)
@@ -316,45 +393,35 @@ class OptimizedPIDSimulation:
         axes[1, 1].grid(True)
         
         plt.tight_layout()
-        plt.savefig('pid_comparison_results.png', dpi=150, bbox_inches='tight')
+        plt.savefig('anti_overshoot_comparison.png', dpi=150, bbox_inches='tight')
         plt.show()
         
     def recommend_best_config(self, results: List[Dict]):
         """最適な設定を推薦"""
-        print("\n=== 設定推薦 ===")
+        print("\n=== オーバーシュート抑制設定推薦 ===")
         
         # 各指標での最優秀を探す
-        min_steady_error = min(results, key=lambda x: x['performance']['steady_state_error'])
         min_overshoot = min(results, key=lambda x: x['performance']['max_overshoot'])
+        min_steady_error = min(results, key=lambda x: x['performance']['steady_state_error'])
         min_settling_time = min([r for r in results if r['performance']['settling_time'] is not None], 
                               key=lambda x: x['performance']['settling_time'])
-        min_rms_error = min(results, key=lambda x: x['performance']['rms_error'])
         
-        print(f"最小定常誤差: {min_steady_error['config']['name']} ({min_steady_error['performance']['steady_state_error']:.3f}m)")
         print(f"最小オーバーシュート: {min_overshoot['config']['name']} ({min_overshoot['performance']['max_overshoot']:.3f}m)")
+        print(f"最小定常誤差: {min_steady_error['config']['name']} ({min_steady_error['performance']['steady_state_error']:.3f}m)")  
         print(f"最短整定時間: {min_settling_time['config']['name']} ({min_settling_time['performance']['settling_time']:.2f}s)")
-        print(f"最小RMS誤差: {min_rms_error['config']['name']} ({min_rms_error['performance']['rms_error']:.3f}m)")
         
-        # 総合スコア計算（重み付き）
-        print(f"\n総合評価 (定常誤差×2 + オーバーシュート + RMS誤差×2):")
+        # オーバーシュート重視スコア計算
+        print(f"\nオーバーシュート重視評価 (オーバーシュート×3 + 定常誤差 + 整定時間/10):")
         for result in results:
             perf = result['performance']
-            # 正規化のために最大値で割る
-            max_steady = max(r['performance']['steady_state_error'] for r in results)
-            max_overshoot = max(r['performance']['max_overshoot'] for r in results)
-            max_rms = max(r['performance']['rms_error'] for r in results)
-            
-            normalized_steady = perf['steady_state_error'] / max_steady
-            normalized_overshoot = perf['max_overshoot'] / max_overshoot  
-            normalized_rms = perf['rms_error'] / max_rms
-            
-            composite_score = 2*normalized_steady + normalized_overshoot + 2*normalized_rms
-            print(f"  {result['config']['name']}: {composite_score:.3f}")
-        
-        
+            settling_penalty = perf['settling_time'] / 10.0 if perf['settling_time'] else 2.0
+            overshoot_score = 3 * perf['max_overshoot'] + perf['steady_state_error'] + settling_penalty
+            print(f"  {result['config']['name']}: {overshoot_score:.3f}")
+
+
 def main():
     """メイン実行関数"""
-    sim = OptimizedPIDSimulation()
+    sim = AntiOvershootSimulation()
     results = sim.run_comparison()
 
 

@@ -154,7 +154,7 @@ class SimplePIDSimulation:
             thrust_command = pid_output + self.plant.mass * self.plant.gravity
             
             # 推力制限（現実的な範囲）
-            max_thrust = 50.0  # 最大推力 [N]
+            max_thrust = 1000.0  # 最大推力 [N]
             thrust_command = np.clip(thrust_command, 0, max_thrust)
             
             # 植物モデルを更新
