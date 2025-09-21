@@ -1,7 +1,7 @@
 numeric:
   plant_endpoint: "tcp://plant:5555"
   dt: 0.01
-  max_steps: 2000  # 20 second long test
+  max_steps: 4000  # 20 second long test
   timeout_ms: 5000
   log_file: "/app/logs/numeric_log.csv"
 

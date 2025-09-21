@@ -86,8 +86,13 @@ class HILSAnalyzer:
         if run_dir is None:
             return {}
             
+        # Check for both possible numeric log filenames
+        numeric_file = run_dir / "numeric_log.csv"
+        if not numeric_file.exists():
+            numeric_file = run_dir / "realtime_numeric_log.csv"
+            
         files = {
-            'numeric': run_dir / "numeric_log.csv",
+            'numeric': numeric_file,
             'plant': run_dir / "plant_log.csv"
         }
         return {k: v for k, v in files.items() if v.exists()}
@@ -146,7 +151,7 @@ class HILSAnalyzer:
         fig.suptitle('HILS Comprehensive Analysis Dashboard', fontsize=18, fontweight='bold')
         
         # Data preparation
-        t = self.numeric_data['t'].values
+        t = self.numeric_data['sim_time'].values
         altitude = self.numeric_data['altitude'].values
         thrust_cmd = self.numeric_data['thrust_cmd'].values
         velocity = self.numeric_data['velocity'].values
@@ -268,7 +273,7 @@ class HILSAnalyzer:
         ax = fig.add_subplot(111)
         
         altitude = self.numeric_data['altitude'].values
-        t = self.numeric_data['t'].values
+        t = self.numeric_data['sim_time'].values
         setpoint = self.numeric_data['setpoint'].values[0]  # Constant setpoint
         
         # Plot altitude trajectory over time
@@ -293,7 +298,7 @@ class HILSAnalyzer:
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         fig.suptitle('HILS Performance Analysis Report', fontsize=16, fontweight='bold')
         
-        t = self.numeric_data['t'].values
+        t = self.numeric_data['sim_time'].values
         altitude = self.numeric_data['altitude'].values
         thrust_cmd = self.numeric_data['thrust_cmd'].values
         velocity = self.numeric_data['velocity'].values

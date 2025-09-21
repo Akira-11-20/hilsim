@@ -4,6 +4,13 @@ plant:
   max_steps: 100000
   log_file: "/app/logs/plant_log.csv"
 
+communication:
+  # Realistic plant communication delays [ms]
+  processing_delay: 0.0      # Plant processing time (0-50ms typical)
+  response_delay: 0.0        # Response transmission time (0-100ms typical)  
+  delay_variation: 0.0       # Random jitter (0-20ms typical)
+  enable_delay: false        # Enable communication delay simulation
+
 simulation:
   mass: 1.0
   gravity: 9.81    # Positive gravity value (handled correctly in code)

@@ -1,22 +1,41 @@
-.PHONY: build up down logs clean status test help
+.PHONY: build up up-bg down logs clean status test help
 
-# Python path - tries virtual env first, fallback to system python3
-PYTHON := $(shell which python3 2>/dev/null || echo python3)
+# UV-based Python dependency management
+UV := $(shell which uv 2>/dev/null || echo "uv-not-found")
 
-# Setup Python dependencies
+# Setup Python dependencies with uv
 setup:
-	@echo "Installing Python dependencies..."
-	$(PYTHON) -m pip install -r requirements.txt
-	@echo "Dependencies installed."
+	@echo "Setting up Python environment with uv..."
+	@if [ "$(UV)" = "uv-not-found" ]; then \
+		echo "❌ uv not found. Please install uv first:"; \
+		echo "   curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+		exit 1; \
+	fi
+	$(UV) sync
+	@echo "✅ Dependencies installed with uv."
+
+# Install development dependencies
+setup-dev: setup
+	@echo "Installing development dependencies..."
+	$(UV) sync --extra dev
+	@echo "✅ Development dependencies installed."
 
 # Build all Docker images
 build:
 	@echo "Building HILS Docker containers..."
 	docker compose -f docker/compose.yaml build
 
-# Start the HILS simulation
+# Start the HILS simulation and wait for completion
 up:
 	@echo "Starting HILS simulation..."
+	@export RUN_ID=$$(date +%Y%m%d_%H%M%S) && \
+	echo "Run ID: $$RUN_ID" && \
+	echo "⏳ Running simulation... (This will take ~40 seconds)" && \
+	RUN_ID=$$RUN_ID docker compose -f docker/compose.yaml up
+
+# Start the HILS simulation in background (detached mode)
+up-bg:
+	@echo "Starting HILS simulation in background..."
 	@export RUN_ID=$$(date +%Y%m%d_%H%M%S) && \
 	echo "Run ID: $$RUN_ID" && \
 	RUN_ID=$$RUN_ID docker compose -f docker/compose.yaml up -d
@@ -105,12 +124,12 @@ monitor:
 # Integrated log management and visualization
 analyze:
 	@echo "Running HILS analysis..."
-	$(PYTHON) scripts/hils_analyzer.py visualize
+	$(UV) run python scripts/hils_analyzer.py visualize
 	@echo "Analysis complete."
 
 # Show log status
 logs-status:
-	$(PYTHON) scripts/hils_analyzer.py status
+	$(UV) run python scripts/hils_analyzer.py status
 
 
 
@@ -118,9 +137,11 @@ logs-status:
 help:
 	@echo "HILS Simulation Makefile Commands:"
 	@echo ""
-	@echo "  setup     - Install Python dependencies"
+	@echo "  setup     - Install Python dependencies with uv"
+	@echo "  setup-dev - Install Python dependencies with dev tools"
 	@echo "  build     - Build all Docker containers"
-	@echo "  up        - Start the HILS simulation"
+	@echo "  up        - Start the HILS simulation and wait for completion"
+	@echo "  up-bg     - Start the HILS simulation in background"
 	@echo "  down      - Stop the HILS simulation"  
 	@echo "  restart   - Restart the simulation (down + up)"
 	@echo "  rebuild   - Force clean rebuild (clean + build + up)"

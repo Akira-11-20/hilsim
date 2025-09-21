@@ -173,12 +173,12 @@ class NumericSimulator:
             }
             
             send_time = time.time()
+            perf_start = time.perf_counter()  # 高精度相対時間計測
             self.socket.send_json(request)
             
             response = self.socket.recv_json()
             recv_time = time.time()
-            
-            rtt_ms = (recv_time - send_time) * 1000
+            rtt_ms = (time.perf_counter() - perf_start) * 1000  # 必ず正の値
             
             return {
                 'response': response,
@@ -262,6 +262,21 @@ class NumericSimulator:
             self.cleanup()
             
         logger.info(f"Simulation completed: {successful_steps} successful, {failed_steps} failed")
+        
+        # Print completion notification to stdout (visible in docker logs)
+        import sys
+        completion_msg = f"""
+{'='*60}
+🚀 HILS SIMULATION COMPLETED 🚀
+{'='*60}
+Steps: {successful_steps}/{self.max_steps} successful ({successful_steps/self.max_steps*100:.1f}%)
+Communication: {failed_steps} failures
+{'='*60}
+📊 Run 'make analyze' to view results
+{'='*60}
+"""
+        print(completion_msg, flush=True)
+        sys.stdout.flush()
         
     def cleanup(self):
         if hasattr(self, 'log_fp'):

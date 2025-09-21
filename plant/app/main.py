@@ -69,6 +69,17 @@ class PlantSimulator:
         self.bind_address = os.getenv('PLANT_BIND', self.config['plant']['bind_address'])
         self.dt = float(os.getenv('STEP_DT', self.config['plant']['dt']))
         
+        # Communication delay settings
+        comm_config = self.config.get('communication', {})
+        self.enable_delay = comm_config.get('enable_delay', False)
+        self.processing_delay = comm_config.get('processing_delay', 0.0) / 1000.0  # ms to s
+        self.response_delay = comm_config.get('response_delay', 0.0) / 1000.0      # ms to s
+        self.delay_variation = comm_config.get('delay_variation', 0.0) / 1000.0    # ms to s
+        
+        if self.enable_delay:
+            logger.info(f"Communication delay enabled: processing={self.processing_delay*1000:.1f}ms, "
+                       f"response={self.response_delay*1000:.1f}ms, variation={self.delay_variation*1000:.1f}ms")
+        
         # Create timestamped log directory
         run_id = os.getenv('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
         log_dir = f"/app/logs/{run_id}"
@@ -139,6 +150,15 @@ class PlantSimulator:
                 
                 logger.debug(f"Received: seq={seq}, t={t}, u={u}")
                 
+                # Simulate processing delay (after receiving command)
+                if self.enable_delay and self.processing_delay > 0:
+                    # Add random jitter if specified
+                    actual_delay = self.processing_delay
+                    if self.delay_variation > 0:
+                        actual_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
+                    if actual_delay > 0:
+                        time.sleep(actual_delay)
+                
                 # Reset state if new simulation starts (seq == 0)
                 if seq == 0:
                     sim_config = self.config['simulation']
@@ -159,6 +179,15 @@ class PlantSimulator:
                     "y": sensor_data,
                     "valid": True
                 }
+                
+                # Simulate response delay (before sending response)
+                if self.enable_delay and self.response_delay > 0:
+                    # Add random jitter if specified  
+                    actual_delay = self.response_delay
+                    if self.delay_variation > 0:
+                        actual_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
+                    if actual_delay > 0:
+                        time.sleep(actual_delay)
                 
                 send_time = time.time()
                 

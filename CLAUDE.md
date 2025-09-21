@@ -9,7 +9,8 @@ HILS（Hardware-in-the-Loop Simulation）二システムシミュレーション
 ## コマンド
 
 ### 基本操作
-- セットアップ: `make setup` - Python依存関係のインストール
+- セットアップ: `make setup` - Python依存関係のuvでのインストール
+- 開発環境: `make setup-dev` - 開発用依存関係も含めてインストール
 - ビルド: `make build` - Dockerコンテナのビルド
 - 実行開始: `make up` - HILSシミュレーションの開始
 - 実行停止: `make down` - HILSシミュレーションの停止

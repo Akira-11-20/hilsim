@@ -20,7 +20,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-    restart: unless-stopped
+    restart: "no"
 
   numeric:
     build: ../numeric
@@ -36,10 +36,12 @@ services:
       - STEP_DT=${STEP_DT}
       - MAX_STEPS=${MAX_STEPS}
       - RUN_ID=${RUN_ID}
+      - REALTIME_MODE=${REALTIME_MODE:-0}
     volumes:
       - ../logs:/app/logs
       - ../shared:/app/shared:ro
-    restart: unless-stopped
+    command: ["python", "main_realtime.py"]
+    restart: "no"
 
 networks:
   hilsnet:
