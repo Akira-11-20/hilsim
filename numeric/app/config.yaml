@@ -7,9 +7,9 @@ numeric:
 
 controller:
   type: "pid"
-  kp: 18.0     # Aggressive proportional gain - proven optimal
-  ki: 2.5      # Strong integral term for steady-state error elimination  
-  kd: 10.0     # Strong derivative damping for overshoot control
+  kp: 8.0      # More aggressive gain to see delay effects
+  ki: 1.0      # Higher integral to test stability with delays
+  kd: 3.0      # Higher derivative for faster response
   setpoint: 10.0  # Target altitude [m]
 
 scenario:

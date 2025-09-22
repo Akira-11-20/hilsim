@@ -7,19 +7,13 @@ services:
     networks: 
       - hilsnet
     ports:
-      - "5555:5555"
+      - "5555:5555"  # State publisher
     environment:
-      - PLANT_BIND=${PLANT_BIND}
       - STEP_DT=${STEP_DT}
+      - MAX_STEPS=${MAX_STEPS}
       - RUN_ID=${RUN_ID}
     volumes:
       - ../logs:/app/logs
-    healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1', 5555)); print('OK')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
     restart: "no"
 
   numeric:
@@ -27,16 +21,17 @@ services:
     container_name: hils-numeric
     user: "1000:1000"
     depends_on:
-      plant:
-        condition: service_healthy
+      - plant
     networks:
       - hilsnet
+    ports:
+      - "5556:5556"  # Command publisher
     environment:
-      - PLANT_ENDPOINT=${PLANT_ENDPOINT}
+      - PLANT_ENDPOINT=tcp://plant:5555
       - STEP_DT=${STEP_DT}
       - MAX_STEPS=${MAX_STEPS}
       - RUN_ID=${RUN_ID}
-      - REALTIME_MODE=${REALTIME_MODE:-0}
+      - REALTIME_MODE=${REALTIME_MODE:-1}
     volumes:
       - ../logs:/app/logs
       - ../shared:/app/shared:ro

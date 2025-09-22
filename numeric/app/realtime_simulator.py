@@ -75,133 +75,106 @@ class AltitudePIDController:
 
 
 class AsyncPlantCommunicator:
-    """非同期Plant通信クラス"""
+    """非同期Plant通信クラス - PUB/SUB版"""
     
-    def __init__(self, plant_endpoint: str, timeout_ms: int):
-        self.plant_endpoint = plant_endpoint
-        self.timeout_ms = timeout_ms
+    def __init__(self, plant_state_endpoint: str, cmd_publish_port: int = 5556):
+        self.plant_state_endpoint = plant_state_endpoint
+        self.cmd_publish_port = cmd_publish_port
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self.socket.connect(plant_endpoint)
+        
+        # State subscriber (Plant → Numeric)
+        self.state_subscriber = self.context.socket(zmq.SUB)
+        self.state_subscriber.connect(plant_state_endpoint)
+        self.state_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+        self.state_subscriber.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
+        
+        # Command publisher (Numeric → Plant)
+        self.cmd_publisher = self.context.socket(zmq.PUB)
+        self.cmd_publisher.bind(f"tcp://*:{cmd_publish_port}")
         
         # 通信管理
-        self.request_queue = Queue()
-        self.response_queue = Queue()
-        self.latest_response = None
-        self.communication_thread = None
-        self.running = False
+        self.latest_state = None
         self.seq_counter = 0
+        
+        # RTT measurement
+        self.command_timestamps = {}  # seq -> timestamp mapping
         
         # 統計
         self.sent_count = 0
         self.received_count = 0
         self.timeout_count = 0
         
-        logger.info(f"AsyncPlantCommunicator connected to {plant_endpoint}")
+        logger.info(f"AsyncPlantCommunicator setup: SUB from {plant_state_endpoint}, PUB on :{cmd_publish_port}")
         
     def start_communication(self):
-        """通信スレッドを開始"""
-        self.running = True
-        self.communication_thread = threading.Thread(target=self._communication_loop)
-        self.communication_thread.daemon = True
-        self.communication_thread.start()
-        logger.info("Async communication thread started")
+        """通信初期化（PUB/SUB版では不要だが互換性のため）"""
+        logger.info("Async communication ready")
         
     def stop_communication(self):
-        """通信スレッドを停止"""
-        self.running = False
-        if self.communication_thread:
-            self.communication_thread.join(timeout=1.0)
-        self.socket.close()
+        """通信停止"""
+        self.state_subscriber.close()
+        self.cmd_publisher.close()
         self.context.term()
         logger.info("Async communication stopped")
         
     def send_command_async(self, seq: int, sim_time: float, command: List[float]):
         """非同期でコマンドを送信（ノンブロッキング）"""
-        request = {
+        send_timestamp = time.time()
+        cmd_msg = {
             "seq": seq,
             "t": sim_time,
             "u": command,
-            "send_time": time.time()
+            "timestamp": send_timestamp
         }
+        
+        # Store timestamp for RTT calculation
+        self.command_timestamps[seq] = send_timestamp
+        
+        # Clean up old timestamps (keep only last 100)
+        if len(self.command_timestamps) > 100:
+            oldest_seq = min(self.command_timestamps.keys())
+            del self.command_timestamps[oldest_seq]
+        
         try:
-            self.request_queue.put_nowait(request)
-        except:
-            logger.warning(f"Request queue full, dropping command for seq={seq}")
+            self.cmd_publisher.send_json(cmd_msg, zmq.NOBLOCK)
+            self.sent_count += 1
+        except zmq.Again:
+            logger.warning(f"Command send buffer full for seq={seq}")
             
     def get_latest_response(self) -> Optional[Dict]:
         """最新の応答を取得（ノンブロッキング）"""
         try:
-            # キューから最新の応答を取得
+            # Get all available messages, keep only the latest
             while True:
                 try:
-                    self.latest_response = self.response_queue.get_nowait()
-                except Empty:
-                    break
-        except:
-            pass
-            
-        return self.latest_response
-        
-    def _communication_loop(self):
-        """通信スレッドのメインループ"""
-        logger.info("Communication loop started")
-        
-        while self.running:
-            try:
-                # リクエストを待機（タイムアウト付き）
-                try:
-                    request = self.request_queue.get(timeout=0.1)
-                except Empty:
-                    continue
+                    state_msg = self.state_subscriber.recv_json(zmq.NOBLOCK)
+                    recv_time = time.time()
                     
-                # Plantに送信
-                try:
-                    send_time = time.perf_counter()
-                    self.socket.send_json(request)
-                    self.sent_count += 1
+                    # Calculate RTT if we have the command timestamp
+                    rtt_ms = 0.0
+                    latest_cmd_seq = state_msg.get('latest_cmd_seq', -1)
+                    latest_cmd_timestamp = state_msg.get('latest_cmd_timestamp', 0)
                     
-                    # 応答受信
-                    response_raw = self.socket.recv_json()
-                    recv_time = time.perf_counter()
+                    if latest_cmd_seq in self.command_timestamps:
+                        # Calculate actual RTT: current time - command send time from Numeric
+                        send_time = self.command_timestamps[latest_cmd_seq]
+                        rtt_ms = (recv_time - send_time) * 1000
                     
-                    # 応答データに統計情報を追加
-                    response = {
-                        'plant_response': response_raw,
-                        'seq': request['seq'],
-                        'sim_time': request['t'],
-                        'command': request['u'],
-                        'send_time': request['send_time'],
-                        'recv_time': time.time(),
-                        'rtt_ms': (recv_time - send_time) * 1000,
-                        'valid': response_raw.get('valid', False)
+                    self.latest_state = {
+                        'plant_response': state_msg,
+                        'seq': state_msg.get('seq', 0),
+                        'sim_time': state_msg.get('t', 0),
+                        'recv_time': recv_time,
+                        'rtt_ms': rtt_ms,
+                        'valid': state_msg.get('valid', False)
                     }
-                    
-                    # 応答をキューに追加
-                    try:
-                        self.response_queue.put_nowait(response)
-                        self.received_count += 1
-                    except:
-                        # キューが満杯の場合は古い応答を破棄
-                        try:
-                            self.response_queue.get_nowait()
-                            self.response_queue.put_nowait(response)
-                        except:
-                            pass
-                            
+                    self.received_count += 1
                 except zmq.Again:
-                    self.timeout_count += 1
-                    logger.warning(f"Plant communication timeout for seq={request['seq']}")
-                except Exception as e:
-                    logger.error(f"Communication error: {e}")
-                    
-            except Exception as e:
-                logger.error(f"Communication loop error: {e}")
-                time.sleep(0.01)
-                
-        logger.info("Communication loop stopped")
+                    break
+        except Exception as e:
+            logger.warning(f"Error receiving state: {e}")
+            
+        return self.latest_state
 
 
 class RealtimeNumericSimulator:
@@ -259,7 +232,7 @@ class RealtimeNumericSimulator:
                                  'rtt_ms', 'consecutive_failures'])
                                  
     def setup_communication(self):
-        self.communicator = AsyncPlantCommunicator(self.plant_endpoint, self.timeout_ms)
+        self.communicator = AsyncPlantCommunicator(self.plant_endpoint)
         
     def get_command(self, step: int, current_altitude: float) -> List[float]:
         """Generate thrust command - same as original"""

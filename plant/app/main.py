@@ -61,6 +61,19 @@ class PlantSimulator:
         self.setup_simulation()
         self.setup_logging()
         
+        # Independent simulation state
+        self.current_thrust = 0.0
+        self.step_count = 0
+        self.sim_time = 0.0
+        self.max_steps = int(os.getenv('MAX_STEPS', 4000))
+        
+        # Command queue for delayed processing
+        self.command_queue = []
+        
+        # RTT measurement
+        self.latest_command_timestamp = 0.0
+        self.latest_command_seq = -1
+        
     def load_config(self, config_file: str):
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
@@ -87,9 +100,18 @@ class PlantSimulator:
         
     def setup_zmq(self):
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
-        self.socket.bind(self.bind_address)
-        logger.info(f"Plant server bound to {self.bind_address}")
+        
+        # State publisher (Plant → Numeric)
+        self.state_publisher = self.context.socket(zmq.PUB)
+        self.state_publisher.bind("tcp://*:5555")
+        
+        # Command subscriber (Numeric → Plant)
+        self.cmd_subscriber = self.context.socket(zmq.SUB)
+        self.cmd_subscriber.connect("tcp://numeric:5556")
+        self.cmd_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+        self.cmd_subscriber.setsockopt(zmq.RCVTIMEO, 1)  # 1ms timeout
+        
+        logger.info(f"Plant async communication setup: PUB on :5555, SUB on numeric:5556")
         
     def setup_simulation(self):
         sim_config = self.config['simulation']
@@ -136,85 +158,153 @@ class PlantSimulator:
             "velocity": [0.0, 0.0, measured_velocity]   # Z軸速度のみ
         }
     
-    def run(self):
-        logger.info("Plant simulator started")
+    def receive_commands(self):
+        """Non-blocking command reception with delay simulation"""
         try:
             while True:
-                # Wait for request
-                recv_time = time.time()
-                message = self.socket.recv_json()
+                try:
+                    cmd_msg = self.cmd_subscriber.recv_json(zmq.NOBLOCK)
+                    recv_time = time.time()
+                    
+                    # Track latest command for RTT measurement
+                    self.latest_command_timestamp = cmd_msg.get('timestamp', recv_time)
+                    self.latest_command_seq = cmd_msg.get('seq', 0)
+                    
+                    if self.enable_delay:
+                        # Calculate total delay
+                        total_delay = self.processing_delay + self.response_delay
+                        if self.delay_variation > 0:
+                            total_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
+                        
+                        # Queue command with application time
+                        apply_time = recv_time + total_delay
+                        self.command_queue.append({
+                            'thrust': cmd_msg.get('u', [0.0, 0.0, 0.0])[2],
+                            'apply_time': apply_time,
+                            'seq': cmd_msg.get('seq', 0),
+                            'original_timestamp': self.latest_command_timestamp
+                        })
+                    else:
+                        # Apply immediately if no delay
+                        self.current_thrust = cmd_msg.get('u', [0.0, 0.0, 0.0])[2]
+                        
+                except zmq.Again:
+                    break  # No more messages
+        except Exception as e:
+            logger.warning(f"Error receiving commands: {e}")
+    
+    def process_delayed_commands(self):
+        """Apply commands that have passed their delay time"""
+        current_time = time.time()
+        applied_commands = []
+        
+        for cmd in self.command_queue:
+            if current_time >= cmd['apply_time']:
+                self.current_thrust = cmd['thrust']
+                applied_commands.append(cmd)
                 
-                seq = message.get('seq', 0)
-                t = message.get('t', 0.0)
-                u = message.get('u', [0.0, 0.0, 0.0])
+        # Remove applied commands
+        for cmd in applied_commands:
+            self.command_queue.remove(cmd)
+    
+    def broadcast_state(self):
+        """Broadcast current plant state with RTT info and simulated response delay"""
+        # Calculate effective timestamp to include response delay for RTT calculation
+        current_time = time.time()
+        effective_timestamp = current_time
+
+        if self.enable_delay and self.response_delay > 0:
+            # Add response delay to timestamp for RTT calculation without blocking
+            delay_time = self.response_delay
+            if self.delay_variation > 0:
+                delay_time += np.random.uniform(-self.delay_variation, self.delay_variation)
+            effective_timestamp = current_time + delay_time
+
+        state_msg = {
+            "seq": self.step_count,
+            "t": self.sim_time,
+            "y": {
+                "acc": [0.0, 0.0, self.plant.acceleration],
+                "gyro": [0.0, 0.0, 0.0],
+                "position": [0.0, 0.0, self.plant.position],
+                "velocity": [0.0, 0.0, self.plant.velocity]
+            },
+            "valid": True,
+            "timestamp": effective_timestamp,  # Use effective timestamp for RTT
+            # RTT measurement data
+            "latest_cmd_timestamp": self.latest_command_timestamp,
+            "latest_cmd_seq": self.latest_command_seq
+        }
+
+        self.state_publisher.send_json(state_msg)
+    
+    def run(self):
+        """Independent simulation loop"""
+        logger.info(f"Plant independent simulation started: {self.max_steps} steps at {1/self.dt:.0f} Hz")
+        
+        # Reset plant for new simulation
+        sim_config = self.config['simulation']
+        initial_position = float(sim_config['initial_position'])
+        initial_velocity = float(sim_config['initial_velocity'])
+        self.plant.reset(initial_position, initial_velocity)
+        
+        try:
+            start_time = time.perf_counter()
+            
+            for step in range(self.max_steps):
+                step_start = time.perf_counter()
+                self.step_count = step
+                self.sim_time = step * self.dt
                 
-                logger.debug(f"Received: seq={seq}, t={t}, u={u}")
+                # Process any delayed commands
+                self.process_delayed_commands()
                 
-                # Simulate processing delay (after receiving command)
-                if self.enable_delay and self.processing_delay > 0:
-                    # Add random jitter if specified
-                    actual_delay = self.processing_delay
-                    if self.delay_variation > 0:
-                        actual_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
-                    if actual_delay > 0:
-                        time.sleep(actual_delay)
+                # Receive new commands (non-blocking)
+                self.receive_commands()
                 
-                # Reset state if new simulation starts (seq == 0)
-                if seq == 0:
-                    sim_config = self.config['simulation']
-                    initial_position = float(sim_config['initial_position'])
-                    initial_velocity = float(sim_config['initial_velocity'])
-                    self.plant.reset(initial_position, initial_velocity)
-                    self.sim_time = 0.0
-                    self.step_count = 0
-                    logger.info("Plant state reset for new simulation")
+                # Update plant physics
+                position, velocity, acceleration = self.plant.update(self.current_thrust, self.dt)
                 
-                # Simulate one step
-                sensor_data = self.simulate_step(u)
-                
-                # Prepare response
-                response = {
-                    "seq": seq,
-                    "t": self.sim_time,
-                    "y": sensor_data,
-                    "valid": True
-                }
-                
-                # Simulate response delay (before sending response)
-                if self.enable_delay and self.response_delay > 0:
-                    # Add random jitter if specified  
-                    actual_delay = self.response_delay
-                    if self.delay_variation > 0:
-                        actual_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
-                    if actual_delay > 0:
-                        time.sleep(actual_delay)
-                
-                send_time = time.time()
+                # Broadcast state to Numeric
+                self.broadcast_state()
                 
                 # Log data
                 if self.csv_writer:
-                    thrust = u[2] if len(u) > 2 else 0.0
+                    current_time = time.time()
                     self.csv_writer.writerow([
-                        seq, t, recv_time, send_time,
-                        thrust, self.plant.position, self.plant.velocity, self.plant.acceleration
+                        step, self.sim_time, current_time, current_time,
+                        self.current_thrust, position, velocity, acceleration
                     ])
                     self.log_fp.flush()
                 
-                # Send response
-                self.socket.send_json(response)
-                logger.debug(f"Sent: seq={seq}, t={self.sim_time}")
+                # Progress logging
+                if (step + 1) % 500 == 0:
+                    logger.info(f"Plant step {step + 1}/{self.max_steps}, Alt: {position:.2f}m, Thrust: {self.current_thrust:.1f}N")
                 
+                # Fixed timestep
+                elapsed = time.perf_counter() - step_start
+                sleep_time = self.dt - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    logger.warning(f"Plant missed timestep by {-sleep_time*1000:.1f}ms at step {step}")
+            
+            total_time = time.perf_counter() - start_time
+            logger.info(f"Plant simulation completed: {self.max_steps} steps in {total_time:.2f}s")
+            logger.info(f"Average step time: {total_time/self.max_steps*1000:.1f}ms")
+            
         except KeyboardInterrupt:
-            logger.info("Shutdown requested")
+            logger.info("Plant simulation interrupted")
         except Exception as e:
-            logger.error(f"Error in main loop: {e}")
+            logger.error(f"Error in plant simulation: {e}")
         finally:
             self.cleanup()
     
     def cleanup(self):
         if self.csv_writer:
             self.log_fp.close()
-        self.socket.close()
+        self.state_publisher.close()
+        self.cmd_subscriber.close()
         self.context.term()
         logger.info("Plant simulator stopped")
 

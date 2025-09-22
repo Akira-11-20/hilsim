@@ -140,6 +140,13 @@ class HILSAnalyzer:
                 print(f"Loaded {len(self.plant_data)} plant data points")
             except Exception as e:
                 print(f"Warning: Could not load plant data: {e}")
+        
+        # Check if we have both datasets for dual trajectory analysis
+        self.has_dual_trajectory = self.plant_data is not None
+        if self.has_dual_trajectory:
+            print("✅ Both Plant and Numeric trajectories available for comparison")
+        else:
+            print("ℹ️  Only Numeric trajectory available")
                 
         return True
         
@@ -268,28 +275,115 @@ class HILSAnalyzer:
         return fig
         
     def create_trajectory_3d(self):
-        """Create 1D altitude trajectory visualization"""
-        fig = plt.figure(figsize=(12, 9))
-        ax = fig.add_subplot(111)
+        """Create dual trajectory visualization (Plant vs Numeric)"""
+        fig = plt.figure(figsize=(14, 10))
         
-        altitude = self.numeric_data['altitude'].values
-        t = self.numeric_data['sim_time'].values
-        setpoint = self.numeric_data['setpoint'].values[0]  # Constant setpoint
-        
-        # Plot altitude trajectory over time
-        ax.plot(t, altitude, linewidth=3, label='Actual Altitude', color='blue')
-        ax.axhline(y=setpoint, color='red', linestyle='--', linewidth=2, label=f'Target ({setpoint}m)')
-        
-        # Mark important points
-        ax.scatter([t[0]], [altitude[0]], color='green', s=150, marker='o', label='Start')
-        ax.scatter([t[-1]], [altitude[-1]], color='red', s=150, marker='s', label='End')
-        
-        # Formatting
-        ax.set_xlabel('Time [s]')
-        ax.set_ylabel('Altitude [m]')
-        ax.set_title('Altitude Control Trajectory', fontsize=16, fontweight='bold')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+        if self.has_dual_trajectory:
+            # Dual trajectory plot
+            gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+            
+            # Main trajectory comparison
+            ax1 = fig.add_subplot(gs[0, :])
+            
+            # Numeric trajectory (control system view)
+            numeric_alt = self.numeric_data['altitude'].values
+            numeric_t = self.numeric_data['sim_time'].values
+            setpoint = self.numeric_data['setpoint'].values[0]
+            
+            # Plant trajectory (actual physical state)
+            plant_alt = self.plant_data['altitude'].values
+            plant_t = self.plant_data['t'].values
+            
+            ax1.plot(numeric_t, numeric_alt, linewidth=2.5, label='Numeric (Control View)', 
+                    color='#1f77b4', alpha=0.8)
+            ax1.plot(plant_t, plant_alt, linewidth=2.5, label='Plant (Actual Physical)', 
+                    color='#ff7f0e', alpha=0.8)
+            ax1.axhline(y=setpoint, color='red', linestyle='--', linewidth=2, 
+                       label=f'Target ({setpoint}m)')
+            
+            # Mark important points
+            ax1.scatter([numeric_t[0]], [numeric_alt[0]], color='green', s=100, 
+                       marker='o', label='Start', zorder=5)
+            ax1.scatter([plant_t[-1]], [plant_alt[-1]], color='red', s=100, 
+                       marker='s', label='End', zorder=5)
+            
+            ax1.set_xlabel('Time [s]')
+            ax1.set_ylabel('Altitude [m]')
+            ax1.set_title('Dual Trajectory Comparison: Plant vs Numeric', 
+                         fontsize=16, fontweight='bold')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # Trajectory difference analysis
+            ax2 = fig.add_subplot(gs[1, 0])
+            
+            # Interpolate for comparison (different sampling rates)
+            from scipy import interpolate
+            try:
+                # Interpolate plant data to numeric time points
+                plant_interp = interpolate.interp1d(plant_t, plant_alt, 
+                                                  bounds_error=False, fill_value='extrapolate')
+                plant_alt_synced = plant_interp(numeric_t)
+                trajectory_diff = numeric_alt - plant_alt_synced
+                
+                ax2.plot(numeric_t, trajectory_diff, color='purple', linewidth=2)
+                ax2.axhline(y=0, color='black', linestyle='-', alpha=0.5)
+                ax2.fill_between(numeric_t, trajectory_diff, 0, alpha=0.3, color='purple')
+                ax2.set_xlabel('Time [s]')
+                ax2.set_ylabel('Altitude Difference [m]')
+                ax2.set_title('Numeric - Plant Difference\n(Communication Delay Effect)')
+                ax2.grid(True, alpha=0.3)
+                
+                # Add statistics
+                mean_diff = np.mean(np.abs(trajectory_diff))
+                max_diff = np.max(np.abs(trajectory_diff))
+                ax2.text(0.05, 0.95, f'Mean |Diff|: {mean_diff:.3f}m\nMax |Diff|: {max_diff:.3f}m', 
+                        transform=ax2.transAxes, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                        
+            except Exception as e:
+                ax2.text(0.5, 0.5, f'Could not compute difference:\n{str(e)}', 
+                        transform=ax2.transAxes, ha='center', va='center')
+                ax2.set_title('Trajectory Difference Analysis')
+            
+            # Phase portrait comparison
+            ax3 = fig.add_subplot(gs[1, 1])
+            
+            numeric_vel = self.numeric_data['velocity'].values
+            plant_vel = self.plant_data['velocity'].values
+            
+            ax3.plot(numeric_alt, numeric_vel, color='#1f77b4', linewidth=2, 
+                    alpha=0.7, label='Numeric')
+            ax3.plot(plant_alt, plant_vel, color='#ff7f0e', linewidth=2, 
+                    alpha=0.7, label='Plant')
+            ax3.set_xlabel('Altitude [m]')
+            ax3.set_ylabel('Velocity [m/s]')
+            ax3.set_title('Phase Portrait Comparison')
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            
+        else:
+            # Single trajectory plot (fallback)
+            ax = fig.add_subplot(111)
+            
+            altitude = self.numeric_data['altitude'].values
+            t = self.numeric_data['sim_time'].values
+            setpoint = self.numeric_data['setpoint'].values[0]
+            
+            ax.plot(t, altitude, linewidth=3, label='Numeric Altitude', color='blue')
+            ax.axhline(y=setpoint, color='red', linestyle='--', linewidth=2, 
+                      label=f'Target ({setpoint}m)')
+            
+            # Mark important points
+            ax.scatter([t[0]], [altitude[0]], color='green', s=150, marker='o', label='Start')
+            ax.scatter([t[-1]], [altitude[-1]], color='red', s=150, marker='s', label='End')
+            
+            ax.set_xlabel('Time [s]')
+            ax.set_ylabel('Altitude [m]')
+            ax.set_title('Altitude Control Trajectory (Numeric Only)', 
+                        fontsize=16, fontweight='bold')
+            ax.legend()
+            ax.grid(True, alpha=0.3)
         
         return fig
         
@@ -426,7 +520,10 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
             plt.close(fig)
             
         if 'trajectory' in plots:
-            print("Generating 3D trajectory...")
+            if self.has_dual_trajectory:
+                print("Generating dual trajectory comparison (Plant vs Numeric)...")
+            else:
+                print("Generating trajectory visualization...")
             fig = self.create_trajectory_3d()
             filename = target_dir / 'hils_flight_trajectory.png' if target_dir else 'hils_flight_trajectory.png'
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
