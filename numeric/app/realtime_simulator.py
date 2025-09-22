@@ -76,39 +76,99 @@ class AltitudePIDController:
 
 class AsyncPlantCommunicator:
     """非同期Plant通信クラス - PUB/SUB版"""
-    
+
     def __init__(self, plant_state_endpoint: str, cmd_publish_port: int = 5556):
         self.plant_state_endpoint = plant_state_endpoint
         self.cmd_publish_port = cmd_publish_port
         self.context = zmq.Context()
-        
+
         # State subscriber (Plant → Numeric)
         self.state_subscriber = self.context.socket(zmq.SUB)
         self.state_subscriber.connect(plant_state_endpoint)
         self.state_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
         self.state_subscriber.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
-        
+
         # Command publisher (Numeric → Plant)
         self.cmd_publisher = self.context.socket(zmq.PUB)
         self.cmd_publisher.bind(f"tcp://*:{cmd_publish_port}")
-        
+
         # 通信管理
         self.latest_state = None
         self.seq_counter = 0
-        
-        # RTT measurement
-        self.command_timestamps = {}  # seq -> timestamp mapping
-        
+
+        # Synchronized timing
+        self.sync_base_time = None
+        self.is_synchronized = False
+
+        # RTT measurement (now using sync timestamps)
+        self.command_timestamps = {}  # seq -> sync_timestamp mapping
+
         # 統計
         self.sent_count = 0
         self.received_count = 0
         self.timeout_count = 0
-        
+
         logger.info(f"AsyncPlantCommunicator setup: SUB from {plant_state_endpoint}, PUB on :{cmd_publish_port}")
+
+        # Allow ZMQ connections to establish
+        time.sleep(1.0)
         
+    def establish_synchronization(self, sync_delay_seconds=3.0):
+        """同期プロトコルを実行して基準時刻を確立"""
+        logger.info("Starting synchronization protocol...")
+
+        # Phase 1: READY signal
+        ready_msg = {
+            "command": "READY",
+            "sender": "numeric",
+            "timestamp": time.time()
+        }
+        self.cmd_publisher.send_json(ready_msg)
+        logger.info("Sent READY signal to Plant")
+
+        # Phase 2: Wait for READY_ACK from Plant
+        ready_ack_received = False
+        timeout_start = time.time()
+        while not ready_ack_received and (time.time() - timeout_start) < 10.0:
+            try:
+                msg = self.state_subscriber.recv_json(zmq.NOBLOCK)
+                if msg.get("command") == "READY_ACK":
+                    ready_ack_received = True
+                    logger.info("Received READY_ACK from Plant")
+            except zmq.Again:
+                time.sleep(0.01)
+
+        if not ready_ack_received:
+            raise TimeoutError("Plant did not respond to READY signal within 10 seconds")
+
+        # Phase 3: Calculate sync start time and send SYNC_START
+        self.sync_base_time = time.time() + sync_delay_seconds
+        sync_msg = {
+            "command": "SYNC_START",
+            "sync_base_time": self.sync_base_time,
+            "delay_seconds": sync_delay_seconds,
+            "sender": "numeric"
+        }
+        self.cmd_publisher.send_json(sync_msg)
+        logger.info(f"Sent SYNC_START signal, base time: {self.sync_base_time}")
+
+        # Phase 4: Wait for sync time
+        while time.time() < self.sync_base_time:
+            time.sleep(0.001)
+
+        self.is_synchronized = True
+        logger.info("Synchronization established successfully")
+
+    def get_sync_timestamp(self):
+        """同期基準時刻からの相対時間を取得"""
+        if not self.is_synchronized:
+            raise ValueError("Not synchronized - call establish_synchronization() first")
+        return time.time() - self.sync_base_time
+
     def start_communication(self):
         """通信初期化（PUB/SUB版では不要だが互換性のため）"""
-        logger.info("Async communication ready")
+        self.establish_synchronization()
+        logger.info("Async communication ready with synchronization")
         
     def stop_communication(self):
         """通信停止"""
@@ -119,22 +179,26 @@ class AsyncPlantCommunicator:
         
     def send_command_async(self, seq: int, sim_time: float, command: List[float]):
         """非同期でコマンドを送信（ノンブロッキング）"""
-        send_timestamp = time.time()
+        if not self.is_synchronized:
+            raise ValueError("Not synchronized - call establish_synchronization() first")
+
+        sync_timestamp = self.get_sync_timestamp()
         cmd_msg = {
             "seq": seq,
             "t": sim_time,
             "u": command,
-            "timestamp": send_timestamp
+            "sync_timestamp": sync_timestamp,
+            "timestamp": time.time()  # 後方互換性のため保持
         }
-        
-        # Store timestamp for RTT calculation
-        self.command_timestamps[seq] = send_timestamp
-        
+
+        # Store sync timestamp for RTT calculation
+        self.command_timestamps[seq] = sync_timestamp
+
         # Clean up old timestamps (keep only last 100)
         if len(self.command_timestamps) > 100:
             oldest_seq = min(self.command_timestamps.keys())
             del self.command_timestamps[oldest_seq]
-        
+
         try:
             self.cmd_publisher.send_json(cmd_msg, zmq.NOBLOCK)
             self.sent_count += 1
@@ -150,15 +214,26 @@ class AsyncPlantCommunicator:
                     state_msg = self.state_subscriber.recv_json(zmq.NOBLOCK)
                     recv_time = time.time()
                     
-                    # Calculate RTT if we have the command timestamp
+                    # Calculate RTT using synchronized timestamps
                     rtt_ms = 0.0
                     latest_cmd_seq = state_msg.get('latest_cmd_seq', -1)
-                    latest_cmd_timestamp = state_msg.get('latest_cmd_timestamp', 0)
-                    
-                    if latest_cmd_seq in self.command_timestamps:
-                        # Calculate actual RTT: current time - command send time from Numeric
-                        send_time = self.command_timestamps[latest_cmd_seq]
-                        rtt_ms = (recv_time - send_time) * 1000
+
+                    if self.is_synchronized and latest_cmd_seq in self.command_timestamps:
+                        # Use sync timestamp for RTT calculation
+                        recv_sync_timestamp = self.get_sync_timestamp()
+                        send_sync_timestamp = self.command_timestamps[latest_cmd_seq]
+                        rtt_ms = (recv_sync_timestamp - send_sync_timestamp) * 1000
+
+                        # Sanity check: RTT should never be negative with sync timestamps
+                        if rtt_ms < 0:
+                            logger.error(f"Negative RTT detected: {rtt_ms}ms - sync error for seq={latest_cmd_seq}")
+                            rtt_ms = 0.0
+                    elif not self.is_synchronized:
+                        # Fallback to old method if not synchronized
+                        latest_cmd_timestamp = state_msg.get('latest_cmd_timestamp', 0)
+                        if latest_cmd_seq in self.command_timestamps:
+                            send_time = self.command_timestamps[latest_cmd_seq]
+                            rtt_ms = (recv_time - send_time) * 1000
                     
                     self.latest_state = {
                         'plant_response': state_msg,
@@ -229,7 +304,9 @@ class RealtimeNumericSimulator:
         self.csv_writer.writerow(['seq', 'sim_time', 'actual_time', 'control_dt',
                                  'thrust_cmd', 'altitude', 'velocity', 'acceleration',
                                  'altitude_error', 'setpoint', 'communication_status',
-                                 'rtt_ms', 'consecutive_failures'])
+                                 'rtt_ms', 'consecutive_failures',
+                                 'step_start_sync', 'cmd_send_sync', 'response_recv_sync',
+                                 'cmd_send_to_recv', 'step_start_wall', 'cmd_send_wall', 'response_recv_wall'])
                                  
     def setup_communication(self):
         self.communicator = AsyncPlantCommunicator(self.plant_endpoint)
@@ -266,11 +343,18 @@ class RealtimeNumericSimulator:
         
         try:
             for step in range(self.max_steps):
+                # Detailed timing tracking
                 step_start_time = time.perf_counter()
-                
+                step_start_sync = self.communicator.get_sync_timestamp()
+                step_start_wall = time.time()
+
                 # 最新のPlant応答を取得
                 latest_response = self.communicator.get_latest_response()
-                
+
+                # Response timing
+                response_recv_sync = self.communicator.get_sync_timestamp()
+                response_recv_wall = time.time()
+
                 if latest_response and latest_response.get('valid', False):
                     # 有効な応答がある場合
                     plant_data = latest_response['plant_response']['y']
@@ -288,16 +372,20 @@ class RealtimeNumericSimulator:
                     communication_status = "TIMEOUT"
                     rtt_ms = 0
                     failed_steps += 1
-                    
+
                     # フォールバック制御（最後の有効値を使用）
                     if self.consecutive_failures > self.max_consecutive_failures:
                         logger.error(f"Too many consecutive failures ({self.consecutive_failures}), using fallback")
                         # 緊急停止またはフェールセーフ制御
                         self.current_altitude = self.last_valid_altitude
-                        
+
                 # 制御コマンド生成
                 command = self.get_command(step, self.current_altitude)
-                
+
+                # Command send timing
+                cmd_send_sync = self.communicator.get_sync_timestamp()
+                cmd_send_wall = time.time()
+
                 # 非同期でPlantにコマンド送信
                 self.communicator.send_command_async(step, self.sim_time, command)
                 
@@ -306,12 +394,17 @@ class RealtimeNumericSimulator:
                 control_dt = actual_time - self.sim_time if step > 0 else self.dt
                 altitude_error = self.controller.setpoint - self.current_altitude
                 
+                # Calculate additional timing metrics
+                cmd_send_to_recv = response_recv_sync - cmd_send_sync if latest_response else 0
+
                 if self.csv_writer:
                     self.csv_writer.writerow([
                         step, self.sim_time, actual_time, control_dt,
-                        command[2], self.current_altitude, self.current_velocity, 
+                        command[2], self.current_altitude, self.current_velocity,
                         self.current_acceleration, altitude_error, self.controller.setpoint,
-                        communication_status, rtt_ms, self.consecutive_failures
+                        communication_status, rtt_ms, self.consecutive_failures,
+                        step_start_sync, cmd_send_sync, response_recv_sync,
+                        cmd_send_to_recv, step_start_wall, cmd_send_wall, response_recv_wall
                     ])
                     self.log_fp.flush()
                 

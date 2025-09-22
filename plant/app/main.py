@@ -73,6 +73,10 @@ class PlantSimulator:
         # RTT measurement
         self.latest_command_timestamp = 0.0
         self.latest_command_seq = -1
+
+        # Synchronized timing
+        self.sync_base_time = None
+        self.is_synchronized = False
         
     def load_config(self, config_file: str):
         with open(config_file, 'r') as f:
@@ -112,6 +116,9 @@ class PlantSimulator:
         self.cmd_subscriber.setsockopt(zmq.RCVTIMEO, 1)  # 1ms timeout
         
         logger.info(f"Plant async communication setup: PUB on :5555, SUB on numeric:5556")
+
+        # Allow ZMQ connections to establish
+        time.sleep(1.0)
         
     def setup_simulation(self):
         sim_config = self.config['simulation']
@@ -135,9 +142,42 @@ class PlantSimulator:
         self.csv_writer = None
         self.log_fp = open(self.log_file, 'w', newline='')
         self.csv_writer = csv.writer(self.log_fp)
-        self.csv_writer.writerow(['seq', 't', 'recv_time', 'send_time', 'thrust', 
-                                 'altitude', 'velocity', 'acceleration'])
-        
+        self.csv_writer.writerow(['seq', 't', 'recv_time', 'send_time', 'thrust',
+                                 'altitude', 'velocity', 'acceleration',
+                                 'step_start_sync', 'step_start_wall', 'sync_base_time'])
+
+    def get_sync_timestamp(self):
+        """同期基準時刻からの相対時間を取得"""
+        if not self.is_synchronized:
+            return 0.0  # 同期前は0を返す
+        return time.time() - self.sync_base_time
+
+    def handle_sync_protocol(self, msg):
+        """同期プロトコルメッセージを処理"""
+        command = msg.get("command")
+
+        if command == "READY":
+            # READY_ACK を送信
+            ack_msg = {
+                "command": "READY_ACK",
+                "sender": "plant",
+                "timestamp": time.time()
+            }
+            self.state_publisher.send_json(ack_msg)
+            logger.info("Sent READY_ACK to Numeric")
+
+        elif command == "SYNC_START":
+            # 同期基準時刻を設定
+            self.sync_base_time = msg.get("sync_base_time")
+            if self.sync_base_time:
+                # 同期時刻まで待機
+                while time.time() < self.sync_base_time:
+                    time.sleep(0.001)
+                self.is_synchronized = True
+                logger.info(f"Synchronization established, base time: {self.sync_base_time}")
+            else:
+                logger.error("SYNC_START message missing sync_base_time")
+
     def simulate_step(self, control_input: List[float]) -> Dict:
         """推力コマンドを受け取り、対応する状態を返す（シンプル化）"""
         # Z軸推力のみ取得
@@ -165,7 +205,12 @@ class PlantSimulator:
                 try:
                     cmd_msg = self.cmd_subscriber.recv_json(zmq.NOBLOCK)
                     recv_time = time.time()
-                    
+
+                    # Check for synchronization protocol messages
+                    if cmd_msg.get("command") in ["READY", "SYNC_START"]:
+                        self.handle_sync_protocol(cmd_msg)
+                        continue
+
                     # Track latest command for RTT measurement
                     self.latest_command_timestamp = cmd_msg.get('timestamp', recv_time)
                     self.latest_command_seq = cmd_msg.get('seq', 0)
@@ -231,6 +276,8 @@ class PlantSimulator:
             },
             "valid": True,
             "timestamp": effective_timestamp,  # Use effective timestamp for RTT
+            "sync_timestamp": self.get_sync_timestamp(),  # Synchronized timestamp
+            "is_synchronized": self.is_synchronized,
             # RTT measurement data
             "latest_cmd_timestamp": self.latest_command_timestamp,
             "latest_cmd_seq": self.latest_command_seq
@@ -238,42 +285,65 @@ class PlantSimulator:
 
         self.state_publisher.send_json(state_msg)
     
+    def wait_for_synchronization(self):
+        """Wait for synchronization protocol from Numeric"""
+        logger.info("Waiting for synchronization protocol from Numeric...")
+
+        timeout_start = time.time()
+        while not self.is_synchronized and (time.time() - timeout_start) < 30.0:
+            try:
+                cmd_msg = self.cmd_subscriber.recv_json(zmq.NOBLOCK)
+                if cmd_msg.get("command") in ["READY", "SYNC_START"]:
+                    self.handle_sync_protocol(cmd_msg)
+            except zmq.Again:
+                time.sleep(0.01)
+
+        if not self.is_synchronized:
+            logger.warning("Synchronization timeout - continuing without sync")
+
     def run(self):
         """Independent simulation loop"""
         logger.info(f"Plant independent simulation started: {self.max_steps} steps at {1/self.dt:.0f} Hz")
-        
+
+        # Wait for synchronization from Numeric
+        self.wait_for_synchronization()
+
         # Reset plant for new simulation
         sim_config = self.config['simulation']
         initial_position = float(sim_config['initial_position'])
         initial_velocity = float(sim_config['initial_velocity'])
         self.plant.reset(initial_position, initial_velocity)
-        
+
         try:
             start_time = time.perf_counter()
             
             for step in range(self.max_steps):
                 step_start = time.perf_counter()
+                step_start_sync = self.get_sync_timestamp()
+                step_start_wall = time.time()
+
                 self.step_count = step
                 self.sim_time = step * self.dt
-                
+
                 # Process any delayed commands
                 self.process_delayed_commands()
-                
+
                 # Receive new commands (non-blocking)
                 self.receive_commands()
-                
+
                 # Update plant physics
                 position, velocity, acceleration = self.plant.update(self.current_thrust, self.dt)
-                
+
                 # Broadcast state to Numeric
                 self.broadcast_state()
-                
-                # Log data
+
+                # Log data with sync verification timestamps
                 if self.csv_writer:
                     current_time = time.time()
                     self.csv_writer.writerow([
                         step, self.sim_time, current_time, current_time,
-                        self.current_thrust, position, velocity, acceleration
+                        self.current_thrust, position, velocity, acceleration,
+                        step_start_sync, step_start_wall, self.sync_base_time
                     ])
                     self.log_fp.flush()
                 
