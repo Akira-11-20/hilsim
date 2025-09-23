@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
-import zmq
-import json
+"""
+Plant シミュレーターメインファイル
+
+物理シミュレーション（高度制御対象）を実行し、
+Numeric側との通信を通信モジュールに委譲。
+
+主要機能：
+- SimpleAltitudePlant: 1次元高度物理モデル
+- 独立シミュレーションループ（固定周期実行）
+- 通信モジュールとの連携
+- ログ記録・分析
+"""
+
 import yaml
 import numpy as np
 import os
@@ -10,305 +21,227 @@ import csv
 import logging
 from typing import Dict, List, Tuple
 
+# 通信モジュールをインポート
+from plant_communication import PlantCommunicationManager
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
 class SimpleAltitudePlant:
-    """シンプルな高度植物モデル（質点の1次元運動）- 動作確認済みモデル"""
-    
+    """
+    シンプルな高度植物モデル（質点の1次元運動）- 動作確認済みモデル
+
+    ニュートンの運動方程式に基づく基本的な物理シミュレーション：
+    F = ma → a = (F_thrust - mg) / m
+
+    状態変数：
+    - position: 高度[m]
+    - velocity: 速度[m/s]
+    - acceleration: 加速度[m/s²]
+    """
+
     def __init__(self, mass: float = 1.0, gravity: float = 9.81):
-        self.mass = mass
-        self.gravity = gravity
-        
-        # 状態変数
-        self.position = 0.0    # 高度 [m]
-        self.velocity = 0.0    # 速度 [m/s]
-        self.acceleration = 0.0 # 加速度 [m/s²]
-        
+        """
+        物理モデル初期化
+
+        Args:
+            mass: 機体質量[kg]
+            gravity: 重力加速度[m/s²]
+        """
+        self.mass = mass        # 機体質量
+        self.gravity = gravity  # 重力加速度
+
+        # ===== 状態変数 =====
+        self.position = 0.0     # 高度[m]
+        self.velocity = 0.0     # 速度[m/s]
+        self.acceleration = 0.0 # 加速度[m/s²]
+
     def reset(self, initial_position: float = 0.0, initial_velocity: float = 0.0):
-        """植物状態をリセット"""
+        """
+        植物状態をリセット
+
+        Args:
+            initial_position: 初期高度[m]
+            initial_velocity: 初期速度[m/s]
+        """
         self.position = initial_position
         self.velocity = initial_velocity
         self.acceleration = 0.0
-        
+
     def update(self, thrust: float, dt: float) -> Tuple[float, float, float]:
-        """植物モデルの更新"""
-        # 力の計算: F_thrust - mg = ma
-        # thrust: 上向き正、gravity: 下向き正
+        """
+        物理モデルの時間更新
+
+        Args:
+            thrust: 推力[N]（上向き正）
+            dt: 時間ステップ[s]
+
+        Returns:
+            (測定高度, 測定速度, 加速度) - センサーノイズ付き
+        """
+        # ===== 力の計算: F_net = F_thrust - mg =====
         net_force = thrust - self.mass * self.gravity
-        
-        # 加速度の計算
+
+        # ===== 加速度計算: a = F_net / m =====
         self.acceleration = net_force / self.mass
-        
-        # オイラー積分で状態更新
-        self.velocity += self.acceleration * dt
-        self.position += self.velocity * dt
-        
-        # センサーノイズを追加（現実的に）
-        position_noise = np.random.normal(0, 0.005)  # 0.5cm標準偏差
-        velocity_noise = np.random.normal(0, 0.005)  # 0.5cm/s標準偏差
-        
+
+        # ===== オイラー積分による状態更新 =====
+        self.velocity += self.acceleration * dt    # v = v0 + a*dt
+        self.position += self.velocity * dt        # x = x0 + v*dt
+
+        # ===== センサーノイズを追加（現実的なシミュレーション）=====
+        position_noise = np.random.normal(0, 0.005)  # 位置：0.5cm標準偏差
+        velocity_noise = np.random.normal(0, 0.005)  # 速度：0.5cm/s標準偏差
+
         return (
-            self.position + position_noise,
-            self.velocity + velocity_noise,
-            self.acceleration
+            self.position + position_noise,    # 測定高度
+            self.velocity + velocity_noise,    # 測定速度
+            self.acceleration                  # 加速度（ノイズなし）
         )
 
-class PlantSimulator:
-    def __init__(self, config_file: str = "config.yaml"):
-        self.load_config(config_file)
-        self.setup_zmq()
-        self.setup_simulation()
-        self.setup_logging()
-        
-        # Independent simulation state
-        self.current_thrust = 0.0
-        self.step_count = 0
-        self.sim_time = 0.0
-        self.max_steps = int(os.getenv('MAX_STEPS', 4000))
-        
-        # Command queue for delayed processing
-        self.command_queue = []
-        
-        # RTT measurement
-        self.latest_command_timestamp = 0.0
-        self.latest_command_seq = -1
 
-        # Synchronized timing
-        self.sync_base_time = None
-        self.is_synchronized = False
-        
+class PlantSimulator:
+    """
+    Plantシミュレーターメインクラス
+
+    物理シミュレーションを実行し、通信モジュールを通じて
+    Numeric側とのデータ交換を行う。
+
+    主要機能：
+    - 独立したシミュレーションループ
+    - 通信モジュールとの連携
+    - ログ記録・分析
+    - 設定管理
+    """
+
+    def __init__(self, config_file: str = "config.yaml"):
+        """
+        シミュレーター初期化
+
+        Args:
+            config_file: 設定ファイルパス（YAML形式）
+        """
+        self.load_config(config_file)       # 設定読み込み
+        self.setup_communication()          # 通信システム設定
+        self.setup_simulation()             # 物理シミュレーション設定
+        self.setup_logging()                # ログシステム設定
+
+        # ===== シミュレーション状態 =====
+        self.current_thrust = 0.0      # 現在の推力[N]
+        self.step_count = 0            # ステップカウンタ
+        self.sim_time = 0.0            # シミュレーション時刻[s]
+        self.max_steps = int(os.getenv('MAX_STEPS', 4000))  # 最大ステップ数
+
     def load_config(self, config_file: str):
+        """
+        設定ファイル読み込み・環境変数による上書き
+
+        Args:
+            config_file: YAML設定ファイルパス
+        """
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        # Override with environment variables
+
+        # 環境変数による設定上書き（Docker環境での動的設定用）
         self.bind_address = os.getenv('PLANT_BIND', self.config['plant']['bind_address'])
-        self.dt = float(os.getenv('STEP_DT', self.config['plant']['dt']))
-        
-        # Communication delay settings
-        comm_config = self.config.get('communication', {})
-        self.enable_delay = comm_config.get('enable_delay', False)
-        self.processing_delay = comm_config.get('processing_delay', 0.0) / 1000.0  # ms to s
-        self.response_delay = comm_config.get('response_delay', 0.0) / 1000.0      # ms to s
-        self.delay_variation = comm_config.get('delay_variation', 0.0) / 1000.0    # ms to s
-        
-        if self.enable_delay:
-            logger.info(f"Communication delay enabled: processing={self.processing_delay*1000:.1f}ms, "
-                       f"response={self.response_delay*1000:.1f}ms, variation={self.delay_variation*1000:.1f}ms")
-        
-        # Create timestamped log directory
+        self.dt = float(os.getenv('STEP_DT', self.config['plant']['dt']))  # シミュレーション周期[s]
+
+        # タイムスタンプ付きログディレクトリ作成
         run_id = os.getenv('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
         log_dir = f"/app/logs/{run_id}"
         self.log_file = f"{log_dir}/plant_log.csv"
-        
-    def setup_zmq(self):
-        self.context = zmq.Context()
-        
-        # State publisher (Plant → Numeric)
-        self.state_publisher = self.context.socket(zmq.PUB)
-        self.state_publisher.bind("tcp://*:5555")
-        
-        # Command subscriber (Numeric → Plant)
-        self.cmd_subscriber = self.context.socket(zmq.SUB)
-        self.cmd_subscriber.connect("tcp://numeric:5556")
-        self.cmd_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
-        self.cmd_subscriber.setsockopt(zmq.RCVTIMEO, 1)  # 1ms timeout
-        
-        logger.info(f"Plant async communication setup: PUB on :5555, SUB on numeric:5556")
 
-        # Allow ZMQ connections to establish
-        time.sleep(1.0)
-        
+    def setup_communication(self):
+        """
+        通信システムセットアップ
+
+        通信モジュールを使用してNumeric側との通信を初期化
+        """
+        self.comm_manager = PlantCommunicationManager(self.config)
+        self.communicator = self.comm_manager.setup_communication()
+
     def setup_simulation(self):
+        """
+        物理シミュレーションセットアップ
+
+        設定ファイルから物理パラメータを読み込んで物理モデルを初期化
+        """
         sim_config = self.config['simulation']
-        mass = sim_config['mass']
-        gravity = abs(sim_config['gravity'])  # 正の値として使用
-        
+        mass = sim_config['mass']         # 機体質量[kg]
+        gravity = abs(sim_config['gravity'])  # 重力加速度[m/s²]（正の値として使用）
+
         # 動作確認済みの物理モデルを使用
         self.plant = SimpleAltitudePlant(mass=mass, gravity=gravity)
-        
+
         # 初期状態設定
-        initial_position = float(sim_config['initial_position'])
-        initial_velocity = float(sim_config['initial_velocity'])
+        initial_position = float(sim_config['initial_position'])  # 初期高度[m]
+        initial_velocity = float(sim_config['initial_velocity'])  # 初期速度[m/s]
         self.plant.reset(initial_position, initial_velocity)
-        
-        # Simulation time
+
+        # シミュレーション時間初期化
         self.sim_time = 0.0
         self.step_count = 0
-        
+
     def setup_logging(self):
+        """
+        ログシステムセットアップ
+
+        CSV形式でのデータログを設定。物理状態とタイミング情報を記録。
+        """
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
-        self.csv_writer = None
         self.log_fp = open(self.log_file, 'w', newline='')
         self.csv_writer = csv.writer(self.log_fp)
+
+        # CSVヘッダー（分析用データ）
         self.csv_writer.writerow(['seq', 't', 'recv_time', 'send_time', 'thrust',
                                  'altitude', 'velocity', 'acceleration',
                                  'step_start_sync', 'step_start_wall', 'sync_base_time'])
 
-    def get_sync_timestamp(self):
-        """同期基準時刻からの相対時間を取得"""
-        if not self.is_synchronized:
-            return 0.0  # 同期前は0を返す
-        return time.time() - self.sync_base_time
+    def get_state_data(self) -> Dict:
+        """
+        現在の状態データを構築
 
-    def handle_sync_protocol(self, msg):
-        """同期プロトコルメッセージを処理"""
-        command = msg.get("command")
-
-        if command == "READY":
-            # READY_ACK を送信
-            ack_msg = {
-                "command": "READY_ACK",
-                "sender": "plant",
-                "timestamp": time.time()
-            }
-            self.state_publisher.send_json(ack_msg)
-            logger.info("Sent READY_ACK to Numeric")
-
-        elif command == "SYNC_START":
-            # 同期基準時刻を設定
-            self.sync_base_time = msg.get("sync_base_time")
-            if self.sync_base_time:
-                # 同期時刻まで待機
-                while time.time() < self.sync_base_time:
-                    time.sleep(0.001)
-                self.is_synchronized = True
-                logger.info(f"Synchronization established, base time: {self.sync_base_time}")
-            else:
-                logger.error("SYNC_START message missing sync_base_time")
-
-    def simulate_step(self, control_input: List[float]) -> Dict:
-        """推力コマンドを受け取り、対応する状態を返す（シンプル化）"""
-        # Z軸推力のみ取得
-        thrust = control_input[2] if len(control_input) >= 3 else 0.0
-        
-        # 動作確認済みのplantモデルで状態更新
-        measured_position, measured_velocity, acceleration = self.plant.update(thrust, self.dt)
-        
-        # 時間更新
-        self.sim_time += self.dt
-        self.step_count += 1
-        
-        # 標準的なセンサーデータフォーマットで返す
+        Returns:
+            標準的なセンサーデータフォーマットの状態辞書
+        """
         return {
-            "acc": [0.0, 0.0, acceleration + np.random.normal(0, 0.01)],  # Z軸加速度計
-            "gyro": [0.0, 0.0, 0.0],  # 回転なし
-            "position": [0.0, 0.0, measured_position],  # 高度のみ
-            "velocity": [0.0, 0.0, measured_velocity]   # Z軸速度のみ
-        }
-    
-    def receive_commands(self):
-        """Non-blocking command reception with delay simulation"""
-        try:
-            while True:
-                try:
-                    cmd_msg = self.cmd_subscriber.recv_json(zmq.NOBLOCK)
-                    recv_time = time.time()
-
-                    # Check for synchronization protocol messages
-                    if cmd_msg.get("command") in ["READY", "SYNC_START"]:
-                        self.handle_sync_protocol(cmd_msg)
-                        continue
-
-                    # Track latest command for RTT measurement
-                    self.latest_command_timestamp = cmd_msg.get('timestamp', recv_time)
-                    self.latest_command_seq = cmd_msg.get('seq', 0)
-                    
-                    if self.enable_delay:
-                        # Calculate total delay
-                        total_delay = self.processing_delay + self.response_delay
-                        if self.delay_variation > 0:
-                            total_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
-                        
-                        # Queue command with application time
-                        apply_time = recv_time + total_delay
-                        self.command_queue.append({
-                            'thrust': cmd_msg.get('u', [0.0, 0.0, 0.0])[2],
-                            'apply_time': apply_time,
-                            'seq': cmd_msg.get('seq', 0),
-                            'original_timestamp': self.latest_command_timestamp
-                        })
-                    else:
-                        # Apply immediately if no delay
-                        self.current_thrust = cmd_msg.get('u', [0.0, 0.0, 0.0])[2]
-                        
-                except zmq.Again:
-                    break  # No more messages
-        except Exception as e:
-            logger.warning(f"Error receiving commands: {e}")
-    
-    def process_delayed_commands(self):
-        """Apply commands that have passed their delay time"""
-        current_time = time.time()
-        applied_commands = []
-        
-        for cmd in self.command_queue:
-            if current_time >= cmd['apply_time']:
-                self.current_thrust = cmd['thrust']
-                applied_commands.append(cmd)
-                
-        # Remove applied commands
-        for cmd in applied_commands:
-            self.command_queue.remove(cmd)
-    
-    def broadcast_state(self):
-        """Broadcast current plant state with RTT info and simulated response delay"""
-        # Calculate effective timestamp to include response delay for RTT calculation
-        current_time = time.time()
-        effective_timestamp = current_time
-
-        if self.enable_delay and self.response_delay > 0:
-            # Add response delay to timestamp for RTT calculation without blocking
-            delay_time = self.response_delay
-            if self.delay_variation > 0:
-                delay_time += np.random.uniform(-self.delay_variation, self.delay_variation)
-            effective_timestamp = current_time + delay_time
-
-        state_msg = {
-            "seq": self.step_count,
-            "t": self.sim_time,
-            "y": {
-                "acc": [0.0, 0.0, self.plant.acceleration],
-                "gyro": [0.0, 0.0, 0.0],
-                "position": [0.0, 0.0, self.plant.position],
-                "velocity": [0.0, 0.0, self.plant.velocity]
-            },
-            "valid": True,
-            "timestamp": effective_timestamp,  # Use effective timestamp for RTT
-            "sync_timestamp": self.get_sync_timestamp(),  # Synchronized timestamp
-            "is_synchronized": self.is_synchronized,
-            # RTT measurement data
-            "latest_cmd_timestamp": self.latest_command_timestamp,
-            "latest_cmd_seq": self.latest_command_seq
+            "acc": [0.0, 0.0, self.plant.acceleration + np.random.normal(0, 0.01)],  # Z軸加速度計
+            "gyro": [0.0, 0.0, 0.0],                                                 # 回転なし
+            "position": [0.0, 0.0, self.plant.position],                           # 高度のみ
+            "velocity": [0.0, 0.0, self.plant.velocity]                            # Z軸速度のみ
         }
 
-        self.state_publisher.send_json(state_msg)
-    
     def wait_for_synchronization(self):
-        """Wait for synchronization protocol from Numeric"""
-        logger.info("Waiting for synchronization protocol from Numeric...")
+        """
+        Numeric側からの同期プロトコル待機
 
-        timeout_start = time.time()
-        while not self.is_synchronized and (time.time() - timeout_start) < 30.0:
-            try:
-                cmd_msg = self.cmd_subscriber.recv_json(zmq.NOBLOCK)
-                if cmd_msg.get("command") in ["READY", "SYNC_START"]:
-                    self.handle_sync_protocol(cmd_msg)
-            except zmq.Again:
-                time.sleep(0.01)
-
-        if not self.is_synchronized:
-            logger.warning("Synchronization timeout - continuing without sync")
+        通信モジュールの同期機能を使用
+        """
+        self.communicator.wait_for_synchronization()
 
     def run(self):
-        """Independent simulation loop"""
+        """
+        独立シミュレーションループメイン実行
+
+        固定周期でPlant物理シミュレーションを実行し、
+        通信モジュールを通じてNumeric側とデータ交換。
+
+        実行フロー：
+        1. 同期プロトコル実行
+        2. 固定周期ループ開始
+        3. 遅延コマンド処理
+        4. 新コマンド受信
+        5. 物理更新
+        6. 状態配信
+        7. ログ記録
+        """
         logger.info(f"Plant independent simulation started: {self.max_steps} steps at {1/self.dt:.0f} Hz")
 
-        # Wait for synchronization from Numeric
+        # ===== 1. Numeric側との同期プロトコル実行 =====
         self.wait_for_synchronization()
 
-        # Reset plant for new simulation
+        # シミュレーション再初期化（同期後に状態リセット）
         sim_config = self.config['simulation']
         initial_position = float(sim_config['initial_position'])
         initial_velocity = float(sim_config['initial_velocity'])
@@ -316,68 +249,87 @@ class PlantSimulator:
 
         try:
             start_time = time.perf_counter()
-            
+
+            # ===== 2. 固定周期メインループ =====
             for step in range(self.max_steps):
                 step_start = time.perf_counter()
-                step_start_sync = self.get_sync_timestamp()
+                step_start_sync = self.communicator.get_sync_timestamp()
                 step_start_wall = time.time()
 
                 self.step_count = step
                 self.sim_time = step * self.dt
 
-                # Process any delayed commands
-                self.process_delayed_commands()
+                # ===== 3. 遅延コマンド処理（遅延シミュレーション有効時）=====
+                delayed_command = self.communicator.process_delayed_commands()
+                if delayed_command is not None:
+                    self.current_thrust = delayed_command[2] if len(delayed_command) >= 3 else 0.0
 
-                # Receive new commands (non-blocking)
-                self.receive_commands()
+                # ===== 4. 新コマンド受信（ノンブロッキング）=====
+                new_command = self.communicator.receive_commands()
+                if new_command is not None:
+                    self.current_thrust = new_command[2] if len(new_command) >= 3 else 0.0
 
-                # Update plant physics
+                # ===== 5. 物理モデル更新 =====
                 position, velocity, acceleration = self.plant.update(self.current_thrust, self.dt)
 
-                # Broadcast state to Numeric
-                self.broadcast_state()
+                # ===== 6. 状態データをNumeric側に配信 =====
+                state_data = self.get_state_data()
+                self.communicator.broadcast_state(step, self.sim_time, state_data)
 
-                # Log data with sync verification timestamps
+                # ===== 7. ログ記録 =====
                 if self.csv_writer:
                     current_time = time.time()
                     self.csv_writer.writerow([
                         step, self.sim_time, current_time, current_time,
                         self.current_thrust, position, velocity, acceleration,
-                        step_start_sync, step_start_wall, self.sync_base_time
+                        step_start_sync, step_start_wall, self.communicator.sync_base_time
                     ])
                     self.log_fp.flush()
-                
-                # Progress logging
+
+                # 進捗表示（500ステップ毎）
                 if (step + 1) % 500 == 0:
                     logger.info(f"Plant step {step + 1}/{self.max_steps}, Alt: {position:.2f}m, Thrust: {self.current_thrust:.1f}N")
-                
-                # Fixed timestep
+
+                # ===== 固定周期制御：次ステップまで待機 =====
                 elapsed = time.perf_counter() - step_start
                 sleep_time = self.dt - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
                 else:
+                    # 周期を逃した場合の警告
                     logger.warning(f"Plant missed timestep by {-sleep_time*1000:.1f}ms at step {step}")
-            
+
+            # ===== 実行結果統計 =====
             total_time = time.perf_counter() - start_time
             logger.info(f"Plant simulation completed: {self.max_steps} steps in {total_time:.2f}s")
             logger.info(f"Average step time: {total_time/self.max_steps*1000:.1f}ms")
-            
+
         except KeyboardInterrupt:
             logger.info("Plant simulation interrupted")
         except Exception as e:
             logger.error(f"Error in plant simulation: {e}")
         finally:
             self.cleanup()
-    
+
     def cleanup(self):
-        if self.csv_writer:
+        """
+        リソース解放・クリーンアップ
+
+        ログファイルと通信リソースを適切に終了
+        """
+        if hasattr(self, 'csv_writer') and self.csv_writer:
             self.log_fp.close()
-        self.state_publisher.close()
-        self.cmd_subscriber.close()
-        self.context.term()
+        if hasattr(self, 'comm_manager'):
+            self.comm_manager.cleanup()
         logger.info("Plant simulator stopped")
 
+
 if __name__ == "__main__":
-    simulator = PlantSimulator()
-    simulator.run()
+    """
+    メインエントリポイント
+
+    スクリプトが直接実行された場合のみPlantシミュレーターを起動
+    Docker環境では config.yaml 設定を使用して実行される
+    """
+    simulator = PlantSimulator()  # シミュレーター初期化
+    simulator.run()               # シミュレーション開始

@@ -7,7 +7,7 @@ plant:
 communication:
   # High delay for testing communication impact
   processing_delay: 0.0     # Plant processing time (extreme case)
-  response_delay: 0.0      # Response transmission time (poor network)
+  response_delay: 20.0      # Response transmission time (poor network)
   delay_variation: 0.0      # Random jitter (very unstable)
   enable_delay: false         # Enable communication delay simulation
 

@@ -1,354 +1,285 @@
 #!/usr/bin/env python3
 """
-リアルタイム制御シミュレーター
+リアルタイム制御シミュレーター（Numeric側）
 固定dt周期で動作し、通信遅延に関係なく一定周期で制御を実行
+HILSシステムの制御部分を担当し、Plantシミュレーションと非同期で通信する
 """
 
-import zmq
-import json
-import yaml
-import numpy as np
-import pandas as pd
-import os
-import sys
-import time
-import csv
-import logging
-import threading
-from queue import Queue, Empty
-from typing import Dict, List, Optional
+# 外部ライブラリのインポート
+import yaml         # YAML設定ファイル読み込み
+import numpy as np  # 数値計算（制御計算、配列操作）
+import pandas as pd # データ分析（未使用だが将来拡張用）
+import os           # 環境変数とファイルシステム操作
+import sys          # システム関数
+import time         # 時間計測とスリープ
+import csv          # CSV形式でのログ出力
+import logging      # ログ出力
+import threading    # マルチスレッド（将来拡張用）
+from queue import Queue, Empty  # キューデータ構造（将来拡張用）
+from typing import Dict, List, Optional  # 型ヒント
 
+# 通信モジュールをインポート
+from numeric_communication import NumericCommunicationManager
+
+# ログ設定：INFO レベル以上のメッセージを時刻付きで出力
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class AltitudePIDController:
-    """動作確認済みのPID制御器"""
-    
+    """
+    高度制御用PID制御器クラス
+
+    PID制御：比例(P) + 積分(I) + 微分(D)制御
+    - P項：現在の誤差に比例した制御
+    - I項：過去の誤差の累積に基づく制御（定常偏差を除去）
+    - D項：誤差の変化率に基づく制御（オーバーシュートを抑制）
+    """
+
     def __init__(self, kp: float, ki: float, kd: float, setpoint: float):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.setpoint = float(setpoint)
-        
-        self.error_sum = 0.0
-        self.prev_error = None
-        self.prev_time = None
-        
-        # 積分項のwindup防止
-        self.integral_limit = 30.0
-        
+        """
+        PID制御器の初期化
+
+        Args:
+            kp: 比例ゲイン（大きいほど応答が速いが振動しやすい）
+            ki: 積分ゲイン（定常偏差を除去、大きすぎると不安定）
+            kd: 微分ゲイン（ダンピング効果、ノイズに敏感）
+            setpoint: 目標値（目標高度[m]）
+        """
+        self.kp = kp                    # 比例ゲイン
+        self.ki = ki                    # 積分ゲイン
+        self.kd = kd                    # 微分ゲイン
+        self.setpoint = float(setpoint) # 目標高度
+
+        # 制御器の内部状態
+        self.error_sum = 0.0      # 誤差の積分値（I項計算用）
+        self.prev_error = None    # 前回の誤差（D項計算用）
+        self.prev_time = None     # 前回の時刻（将来拡張用）
+
+        # 積分項のwindup防止（積分値が無限に大きくなることを防ぐ）
+        self.integral_limit = 300.0  # 積分値の上下限
+
     def reset(self):
-        """制御器状態をリセット"""
-        self.error_sum = 0.0
-        self.prev_error = None
-        self.prev_time = None
-        
+        """
+        制御器状態をリセット
+        シミュレーション開始時や異常時に内部状態をクリア
+        """
+        self.error_sum = 0.0    # 積分値をリセット
+        self.prev_error = None  # 前回誤差をリセット
+        self.prev_time = None   # 前回時刻をリセット
+
     def update(self, measurement: float, dt: float) -> float:
-        """PID制御器の更新"""
+        """
+        PID制御器の更新（制御出力計算）
+
+        Args:
+            measurement: 現在の測定値（現在高度[m]）
+            dt: 制御周期[s]（通常0.01s = 10ms）
+
+        Returns:
+            制御出力（推力補正値[N]）
+        """
+        # 制御誤差 = 目標値 - 現在値
         error = self.setpoint - measurement
-        
+
         # 初回呼び出し時の初期化
         if self.prev_error is None:
             self.prev_error = error
-            
-        # 比例項
+
+        # P項（比例項）：現在の誤差に比例
         p_term = self.kp * error
-        
-        # 積分項（windup防止付き）
-        self.error_sum += error * dt
+
+        # I項（積分項）：過去の誤差の蓄積に比例（定常偏差除去）
+        self.error_sum += error * dt  # 誤差を時間積分
+        # Windup防止：積分値を制限範囲にクリップ
         self.error_sum = np.clip(self.error_sum, -self.integral_limit, self.integral_limit)
         i_term = self.ki * self.error_sum
-        
-        # 微分項
+
+        # D項（微分項）：誤差の変化率に比例（振動抑制）
         if dt > 0:
             d_term = self.kd * (error - self.prev_error) / dt
         else:
-            d_term = 0.0
-            
-        # PID出力
+            d_term = 0.0  # ゼロ除算回避
+
+        # PID出力 = P項 + I項 + D項
         output = p_term + i_term + d_term
-        
-        # 次回のために保存
+
+        # 次回計算のために現在値を保存
         self.prev_error = error
-        
+
         return output
 
 
-class AsyncPlantCommunicator:
-    """非同期Plant通信クラス - PUB/SUB版"""
-
-    def __init__(self, plant_state_endpoint: str, cmd_publish_port: int = 5556):
-        self.plant_state_endpoint = plant_state_endpoint
-        self.cmd_publish_port = cmd_publish_port
-        self.context = zmq.Context()
-
-        # State subscriber (Plant → Numeric)
-        self.state_subscriber = self.context.socket(zmq.SUB)
-        self.state_subscriber.connect(plant_state_endpoint)
-        self.state_subscriber.setsockopt(zmq.SUBSCRIBE, b"")
-        self.state_subscriber.setsockopt(zmq.RCVTIMEO, 10)  # 10ms timeout
-
-        # Command publisher (Numeric → Plant)
-        self.cmd_publisher = self.context.socket(zmq.PUB)
-        self.cmd_publisher.bind(f"tcp://*:{cmd_publish_port}")
-
-        # 通信管理
-        self.latest_state = None
-        self.seq_counter = 0
-
-        # Synchronized timing
-        self.sync_base_time = None
-        self.is_synchronized = False
-
-        # RTT measurement (now using sync timestamps)
-        self.command_timestamps = {}  # seq -> sync_timestamp mapping
-
-        # 統計
-        self.sent_count = 0
-        self.received_count = 0
-        self.timeout_count = 0
-
-        logger.info(f"AsyncPlantCommunicator setup: SUB from {plant_state_endpoint}, PUB on :{cmd_publish_port}")
-
-        # Allow ZMQ connections to establish
-        time.sleep(1.0)
-        
-    def establish_synchronization(self, sync_delay_seconds=3.0):
-        """同期プロトコルを実行して基準時刻を確立"""
-        logger.info("Starting synchronization protocol...")
-
-        # Phase 1: READY signal
-        ready_msg = {
-            "command": "READY",
-            "sender": "numeric",
-            "timestamp": time.time()
-        }
-        self.cmd_publisher.send_json(ready_msg)
-        logger.info("Sent READY signal to Plant")
-
-        # Phase 2: Wait for READY_ACK from Plant
-        ready_ack_received = False
-        timeout_start = time.time()
-        while not ready_ack_received and (time.time() - timeout_start) < 10.0:
-            try:
-                msg = self.state_subscriber.recv_json(zmq.NOBLOCK)
-                if msg.get("command") == "READY_ACK":
-                    ready_ack_received = True
-                    logger.info("Received READY_ACK from Plant")
-            except zmq.Again:
-                time.sleep(0.01)
-
-        if not ready_ack_received:
-            raise TimeoutError("Plant did not respond to READY signal within 10 seconds")
-
-        # Phase 3: Calculate sync start time and send SYNC_START
-        self.sync_base_time = time.time() + sync_delay_seconds
-        sync_msg = {
-            "command": "SYNC_START",
-            "sync_base_time": self.sync_base_time,
-            "delay_seconds": sync_delay_seconds,
-            "sender": "numeric"
-        }
-        self.cmd_publisher.send_json(sync_msg)
-        logger.info(f"Sent SYNC_START signal, base time: {self.sync_base_time}")
-
-        # Phase 4: Wait for sync time
-        while time.time() < self.sync_base_time:
-            time.sleep(0.001)
-
-        self.is_synchronized = True
-        logger.info("Synchronization established successfully")
-
-    def get_sync_timestamp(self):
-        """同期基準時刻からの相対時間を取得"""
-        if not self.is_synchronized:
-            raise ValueError("Not synchronized - call establish_synchronization() first")
-        return time.time() - self.sync_base_time
-
-    def start_communication(self):
-        """通信初期化（PUB/SUB版では不要だが互換性のため）"""
-        self.establish_synchronization()
-        logger.info("Async communication ready with synchronization")
-        
-    def stop_communication(self):
-        """通信停止"""
-        self.state_subscriber.close()
-        self.cmd_publisher.close()
-        self.context.term()
-        logger.info("Async communication stopped")
-        
-    def send_command_async(self, seq: int, sim_time: float, command: List[float]):
-        """非同期でコマンドを送信（ノンブロッキング）"""
-        if not self.is_synchronized:
-            raise ValueError("Not synchronized - call establish_synchronization() first")
-
-        sync_timestamp = self.get_sync_timestamp()
-        cmd_msg = {
-            "seq": seq,
-            "t": sim_time,
-            "u": command,
-            "sync_timestamp": sync_timestamp,
-            "timestamp": time.time()  # 後方互換性のため保持
-        }
-
-        # Store sync timestamp for RTT calculation
-        self.command_timestamps[seq] = sync_timestamp
-
-        # Clean up old timestamps (keep only last 100)
-        if len(self.command_timestamps) > 100:
-            oldest_seq = min(self.command_timestamps.keys())
-            del self.command_timestamps[oldest_seq]
-
-        try:
-            self.cmd_publisher.send_json(cmd_msg, zmq.NOBLOCK)
-            self.sent_count += 1
-        except zmq.Again:
-            logger.warning(f"Command send buffer full for seq={seq}")
-            
-    def get_latest_response(self) -> Optional[Dict]:
-        """最新の応答を取得（ノンブロッキング）"""
-        try:
-            # Get all available messages, keep only the latest
-            while True:
-                try:
-                    state_msg = self.state_subscriber.recv_json(zmq.NOBLOCK)
-                    recv_time = time.time()
-                    
-                    # Calculate RTT using synchronized timestamps
-                    rtt_ms = 0.0
-                    latest_cmd_seq = state_msg.get('latest_cmd_seq', -1)
-
-                    if self.is_synchronized and latest_cmd_seq in self.command_timestamps:
-                        # Use sync timestamp for RTT calculation
-                        recv_sync_timestamp = self.get_sync_timestamp()
-                        send_sync_timestamp = self.command_timestamps[latest_cmd_seq]
-                        rtt_ms = (recv_sync_timestamp - send_sync_timestamp) * 1000
-
-                        # Sanity check: RTT should never be negative with sync timestamps
-                        if rtt_ms < 0:
-                            logger.error(f"Negative RTT detected: {rtt_ms}ms - sync error for seq={latest_cmd_seq}")
-                            rtt_ms = 0.0
-                    elif not self.is_synchronized:
-                        # Fallback to old method if not synchronized
-                        latest_cmd_timestamp = state_msg.get('latest_cmd_timestamp', 0)
-                        if latest_cmd_seq in self.command_timestamps:
-                            send_time = self.command_timestamps[latest_cmd_seq]
-                            rtt_ms = (recv_time - send_time) * 1000
-                    
-                    self.latest_state = {
-                        'plant_response': state_msg,
-                        'seq': state_msg.get('seq', 0),
-                        'sim_time': state_msg.get('t', 0),
-                        'recv_time': recv_time,
-                        'rtt_ms': rtt_ms,
-                        'valid': state_msg.get('valid', False)
-                    }
-                    self.received_count += 1
-                except zmq.Again:
-                    break
-        except Exception as e:
-            logger.warning(f"Error receiving state: {e}")
-            
-        return self.latest_state
-
-
 class RealtimeNumericSimulator:
-    """リアルタイム制御シミュレーター"""
-    
+    """
+    リアルタイム制御シミュレーターメインクラス
+
+    固定周期（通常10ms）でPID制御を実行し、Plantシミュレーションと
+    非同期通信を行うHILSシステムの制御部分。
+
+    主要機能：
+    - 固定周期制御ループ（リアルタイム性確保）
+    - PID高度制御
+    - 非同期Plant通信
+    - 通信障害時のフォールバック制御
+    - 詳細ログ記録・分析
+    """
+
     def __init__(self, config_file: str = "config.yaml"):
-        self.load_config(config_file)
-        self.setup_controller()
-        self.setup_logging()
-        self.setup_communication()
-        
-        # 制御状態
-        self.current_altitude = 0.0
-        self.current_velocity = 0.0
-        self.current_acceleration = 0.0
-        self.sim_time = 0.0
-        self.step_count = 0
-        
-        # フォールバック制御（通信失敗時）
-        self.last_valid_altitude = 0.0
-        self.consecutive_failures = 0
-        self.max_consecutive_failures = 10
+        """
+        シミュレーター初期化
+
+        Args:
+            config_file: 設定ファイルパス（YAML形式）
+        """
+        self.load_config(config_file)       # 設定読み込み
+        self.setup_controller()             # PID制御器設定
+        self.setup_logging()                # ログシステム設定
+        self.setup_communication()          # 通信システム設定
+
+        # ===== 制御状態変数 =====
+        self.current_altitude = 0.0         # 現在高度[m]
+        self.current_velocity = 0.0         # 現在速度[m/s]
+        self.current_acceleration = 0.0     # 現在加速度[m/s²]
+        self.sim_time = 0.0                 # シミュレーション時刻[s]
+        self.step_count = 0                 # ステップカウンタ
+
+        # ===== フォールバック制御（通信失敗時）=====
+        self.last_valid_altitude = 0.0      # 最後の有効高度値
+        self.consecutive_failures = 0       # 連続通信失敗回数
+        self.max_consecutive_failures = 10  # 最大許容連続失敗数
         
     def load_config(self, config_file: str):
+        """
+        設定ファイル読み込み・環境変数による上書き
+
+        Args:
+            config_file: YAML設定ファイルパス
+        """
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
-            
-        # Override with environment variables
+
+        # 環境変数による設定上書き（Docker環境での動的設定用）
         self.plant_endpoint = os.getenv('PLANT_ENDPOINT', self.config['numeric']['plant_endpoint'])
-        self.dt = float(os.getenv('STEP_DT', self.config['numeric']['dt']))
-        self.max_steps = int(os.getenv('MAX_STEPS', self.config['numeric']['max_steps']))
-        self.timeout_ms = self.config['numeric']['timeout_ms']
-        
-        # Create timestamped log directory
+        self.dt = float(os.getenv('STEP_DT', self.config['numeric']['dt']))  # 制御周期[s]
+        self.max_steps = int(os.getenv('MAX_STEPS', self.config['numeric']['max_steps']))  # 最大ステップ数
+        self.timeout_ms = self.config['numeric']['timeout_ms']  # 通信タイムアウト[ms]
+
+        # タイムスタンプ付きログディレクトリ作成
         run_id = os.getenv('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
         log_dir = f"/app/logs/{run_id}"
         self.log_file = f"{log_dir}/realtime_numeric_log.csv"
-        
+
     def setup_controller(self):
+        """
+        PID制御器セットアップ
+
+        設定ファイルからPIDパラメータを読み込んで制御器を初期化
+        """
         ctrl_config = self.config['controller']
         self.controller = AltitudePIDController(
-            kp=ctrl_config['kp'],
-            ki=ctrl_config['ki'], 
-            kd=ctrl_config['kd'],
-            setpoint=ctrl_config['setpoint']
+            kp=ctrl_config['kp'],       # 比例ゲイン
+            ki=ctrl_config['ki'],       # 積分ゲイン
+            kd=ctrl_config['kd'],       # 微分ゲイン
+            setpoint=ctrl_config['setpoint']  # 目標高度[m]
         )
-        
+
     def setup_logging(self):
+        """
+        ログシステムセットアップ
+
+        CSV形式でのデータログを設定。制御性能解析のために
+        詳細なタイミング情報と制御データを記録。
+        """
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         self.log_fp = open(self.log_file, 'w', newline='')
         self.csv_writer = csv.writer(self.log_fp)
+
+        # CSVヘッダー（分析用に豊富なメタデータを含む）
         self.csv_writer.writerow(['seq', 'sim_time', 'actual_time', 'control_dt',
                                  'thrust_cmd', 'altitude', 'velocity', 'acceleration',
                                  'altitude_error', 'setpoint', 'communication_status',
                                  'rtt_ms', 'consecutive_failures',
                                  'step_start_sync', 'cmd_send_sync', 'response_recv_sync',
                                  'cmd_send_to_recv', 'step_start_wall', 'cmd_send_wall', 'response_recv_wall'])
-                                 
+
     def setup_communication(self):
-        self.communicator = AsyncPlantCommunicator(self.plant_endpoint)
+        """
+        通信システムセットアップ
+
+        通信モジュールを使用してPlant側との非同期通信を初期化
+        """
+        self.comm_manager = NumericCommunicationManager(self.config)
+        self.communicator = self.comm_manager.setup_communication(self.plant_endpoint)
         
     def get_command(self, step: int, current_altitude: float) -> List[float]:
-        """Generate thrust command - same as original"""
-        mass = 1.0
-        gravity = 9.81
-        
-        # PID controller with proper gravity compensation
+        """
+        制御コマンド生成
+
+        PID制御器の出力に重力補償を加えて推力コマンドを生成
+
+        Args:
+            step: ステップ番号（未使用）
+            current_altitude: 現在高度[m]
+
+        Returns:
+            制御力ベクトル [fx, fy, fz] [N]
+        """
+        # ===== 物理パラメータ =====
+        mass = 1.0      # 機体質量[kg]
+        gravity = 9.81  # 重力加速度[m/s²]
+
+        # ===== PID制御計算 =====
+        # PID制御器で高度誤差に基づく補正推力を計算
         pid_output = self.controller.update(current_altitude, self.dt)
+
+        # ===== 重力補償付き推力計算 =====
+        # 基本推力（重力釣り合い）+ PID補正推力
         thrust = pid_output + mass * gravity
-        
-        # Thrust limits
-        max_thrust = 1000.0
-        thrust = np.clip(thrust, 0, max_thrust)
-        
+
+        # ===== 推力制限 =====
+        max_thrust = 1000.0  # 最大推力[N]
+        thrust = np.clip(thrust, 0, max_thrust)  # 0以上、max_thrust以下に制限
+
+        # 制御力ベクトル [fx=0, fy=0, fz=thrust]
         return [0.0, 0.0, thrust]
         
     def run_realtime(self):
-        """リアルタイム制御メインループ"""
+        """
+        リアルタイム制御メインループ
+
+        固定周期でPID制御を実行し、Plant側と非同期通信を行う。
+        制御周期は設定ファイルのdt値で決まり、通常10ms（100Hz）。
+
+        制御ループの流れ：
+        1. Plant状態データ受信（ノンブロッキング）
+        2. PID制御計算
+        3. 制御コマンド送信（ノンブロッキング）
+        4. ログ記録
+        5. 次ステップまで待機（固定周期維持）
+        """
         logger.info(f"Realtime simulator started, will run {self.max_steps} steps at {1/self.dt:.0f} Hz")
         logger.info(f"Control period: {self.dt*1000:.1f}ms")
-        
-        # 通信スレッド開始
-        self.communicator.start_communication()
-        
-        # リアルタイム制御ループ
-        start_time = time.perf_counter()
-        next_step_time = start_time
-        
-        successful_steps = 0
-        failed_steps = 0
-        
-        try:
-            for step in range(self.max_steps):
-                # Detailed timing tracking
-                step_start_time = time.perf_counter()
-                step_start_sync = self.communicator.get_sync_timestamp()
-                step_start_wall = time.time()
 
-                # 最新のPlant応答を取得
+        # ===== 通信初期化（同期プロトコル実行）=====
+        self.communicator.start_communication()
+
+        # ===== リアルタイム制御ループ準備 =====
+        start_time = time.perf_counter()  # 高精度時間測定開始
+        next_step_time = start_time       # 次ステップ実行時刻
+
+        # 統計カウンタ
+        successful_steps = 0  # 成功ステップ数
+        failed_steps = 0      # 失敗ステップ数
+
+        try:
+            # ===== メイン制御ループ =====
+            for step in range(self.max_steps):
+                # ===== 詳細タイミング追跡 =====
+                step_start_time = time.perf_counter()  # ステップ開始時刻（高精度）
+                step_start_sync = self.communicator.get_sync_timestamp()  # 同期タイムスタンプ
+                step_start_wall = time.time()  # 壁時計時刻
+
+                # ===== 1. Plant状態データ受信 =====
                 latest_response = self.communicator.get_latest_response()
 
                 # Response timing
@@ -356,18 +287,18 @@ class RealtimeNumericSimulator:
                 response_recv_wall = time.time()
 
                 if latest_response and latest_response.get('valid', False):
-                    # 有効な応答がある場合
+                    # ===== 有効な応答データを受信した場合 =====
                     plant_data = latest_response['plant_response']['y']
-                    self.current_altitude = plant_data['position'][2]
-                    self.current_velocity = plant_data['velocity'][2]
-                    self.current_acceleration = plant_data['acc'][2]
-                    self.last_valid_altitude = self.current_altitude
-                    self.consecutive_failures = 0
+                    self.current_altitude = plant_data['position'][2]     # Z軸位置（高度）
+                    self.current_velocity = plant_data['velocity'][2]     # Z軸速度
+                    self.current_acceleration = plant_data['acc'][2]      # Z軸加速度
+                    self.last_valid_altitude = self.current_altitude      # フォールバック用保存
+                    self.consecutive_failures = 0                        # 失敗カウンタリセット
                     communication_status = "OK"
                     rtt_ms = latest_response.get('rtt_ms', 0)
                     successful_steps += 1
                 else:
-                    # 応答がない場合（遅延またはタイムアウト）
+                    # ===== 応答がない場合（通信遅延・タイムアウト）=====
                     self.consecutive_failures += 1
                     communication_status = "TIMEOUT"
                     rtt_ms = 0
@@ -376,25 +307,25 @@ class RealtimeNumericSimulator:
                     # フォールバック制御（最後の有効値を使用）
                     if self.consecutive_failures > self.max_consecutive_failures:
                         logger.error(f"Too many consecutive failures ({self.consecutive_failures}), using fallback")
-                        # 緊急停止またはフェールセーフ制御
+                        # 緊急時：最後の有効高度値で制御継続
                         self.current_altitude = self.last_valid_altitude
 
-                # 制御コマンド生成
+                # ===== 2. PID制御コマンド生成 =====
                 command = self.get_command(step, self.current_altitude)
 
                 # Command send timing
                 cmd_send_sync = self.communicator.get_sync_timestamp()
                 cmd_send_wall = time.time()
 
-                # 非同期でPlantにコマンド送信
+                # ===== 3. 非同期でPlantにコマンド送信 =====
                 self.communicator.send_command_async(step, self.sim_time, command)
                 
-                # ログ記録
-                actual_time = time.perf_counter() - start_time
-                control_dt = actual_time - self.sim_time if step > 0 else self.dt
-                altitude_error = self.controller.setpoint - self.current_altitude
-                
-                # Calculate additional timing metrics
+                # ===== 4. ログ記録・分析データ保存 =====
+                actual_time = time.perf_counter() - start_time  # 実際の経過時間
+                control_dt = actual_time - self.sim_time if step > 0 else self.dt  # 制御周期偏差
+                altitude_error = self.controller.setpoint - self.current_altitude  # 高度誤差
+
+                # 追加タイミング解析用メトリクス
                 cmd_send_to_recv = response_recv_sync - cmd_send_sync if latest_response else 0
 
                 if self.csv_writer:
@@ -406,22 +337,23 @@ class RealtimeNumericSimulator:
                         step_start_sync, cmd_send_sync, response_recv_sync,
                         cmd_send_to_recv, step_start_wall, cmd_send_wall, response_recv_wall
                     ])
-                    self.log_fp.flush()
-                
-                # 進捗表示
+                    self.log_fp.flush()  # リアルタイムログ出力
+
+                # ===== 進捗表示（100ステップ毎）=====
                 if (step + 1) % 100 == 0:
                     logger.info(f"Step {step + 1}/{self.max_steps}, Alt: {self.current_altitude:.2f}m, "
                               f"Status: {communication_status}, RTT: {rtt_ms:.1f}ms")
-                
-                # 次のステップ時刻まで待機
-                self.sim_time += self.dt
-                next_step_time += self.dt
-                
+
+                # ===== 5. 固定周期制御：次ステップまで待機 =====
+                self.sim_time += self.dt        # シミュレーション時刻更新
+                next_step_time += self.dt       # 次ステップ目標時刻更新
+
+                # リアルタイム性確保：指定時刻まで正確に待機
                 sleep_time = next_step_time - time.perf_counter()
                 if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    time.sleep(sleep_time)  # 次ステップまで待機
                 else:
-                    # 制御周期を逃した場合
+                    # 制御周期を逃した場合の警告（パフォーマンス問題検出）
                     logger.warning(f"Missed control deadline by {-sleep_time*1000:.1f}ms at step {step}")
                     
         except KeyboardInterrupt:
@@ -429,15 +361,20 @@ class RealtimeNumericSimulator:
         except Exception as e:
             logger.error(f"Error in realtime loop: {e}")
         finally:
+            # 必ずリソース解放を実行
             self.cleanup()
-            
+
+        # ===== 実行結果統計・レポート =====
         total_time = time.perf_counter() - start_time
         logger.info(f"Realtime simulation completed: {successful_steps} successful, {failed_steps} failed")
         logger.info(f"Total time: {total_time:.2f}s, Average period: {total_time/self.max_steps*1000:.1f}ms")
-        logger.info(f"Communication stats: Sent={self.communicator.sent_count}, "
-                   f"Received={self.communicator.received_count}, Timeouts={self.communicator.timeout_count}")
-        
-        # Print completion notification to stdout (visible in docker logs)
+
+        # 通信統計取得
+        comm_stats = self.communicator.get_communication_stats()
+        logger.info(f"Communication stats: Sent={comm_stats['sent_count']}, "
+                   f"Received={comm_stats['received_count']}, Timeouts={comm_stats['timeout_count']}")
+
+        # Dockerログに表示される完了通知（視認性向上）
         import sys
         completion_msg = f"""
 {'='*60}
@@ -446,22 +383,33 @@ class RealtimeNumericSimulator:
 Steps: {successful_steps}/{self.max_steps} successful ({successful_steps/self.max_steps*100:.1f}%)
 Runtime: {total_time:.2f}s (Target: {self.max_steps*self.dt:.2f}s)
 Real-time factor: {total_time/(self.max_steps*self.dt):.2f}x
-Communication: {self.communicator.timeout_count} timeouts
+Communication: {comm_stats['timeout_count']} timeouts
 {'='*60}
 📊 Run 'make analyze' to view results
 {'='*60}
 """
         print(completion_msg, flush=True)
         sys.stdout.flush()
-        
+
     def cleanup(self):
+        """
+        リソース解放・クリーンアップ
+
+        ログファイルと通信リソースを適切に終了
+        """
         if hasattr(self, 'log_fp'):
-            self.log_fp.close()
-        if hasattr(self, 'communicator'):
-            self.communicator.stop_communication()
+            self.log_fp.close()  # CSVログファイル終了
+        if hasattr(self, 'comm_manager'):
+            self.comm_manager.cleanup()  # 通信マネージャー終了
         logger.info("Realtime simulator stopped")
 
 
 if __name__ == "__main__":
-    simulator = RealtimeNumericSimulator()
-    simulator.run_realtime()
+    """
+    メインエントリポイント
+
+    スクリプトが直接実行された場合のみリアルタイムシミュレーターを起動
+    Docker環境では config.yaml 設定を使用して実行される
+    """
+    simulator = RealtimeNumericSimulator()  # シミュレーター初期化
+    simulator.run_realtime()                # リアルタイム制御開始

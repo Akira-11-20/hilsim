@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(make:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(uv run:*)"
     ],
     "deny": [],
     "ask": []

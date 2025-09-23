@@ -94,6 +94,35 @@ test: build up
 	@tail -n 5 logs/numeric_log.csv 2>/dev/null || echo "No numeric log found"
 	@$(MAKE) down
 
+# Test communication modules only (no Docker)
+test-comm:
+	@echo "Testing communication logic (recommended)..."
+	cd communication_tests && $(UV) run python delay_logic_test.py
+	@echo "Communication logic test complete."
+
+# Test communication with delay simulation
+test-comm-delay:
+	@echo "Testing communication modules with delay simulation..."
+	cd communication_tests && $(UV) run python test_communication_integration.py --duration 10 --delay
+	@echo "Communication delay test complete."
+
+# RTT monitoring test
+test-rtt:
+	@echo "Starting RTT monitoring..."
+	cd communication_tests && $(UV) run python rtt_monitor.py
+
+# Test Plant communication module only
+test-plant-comm:
+	@echo "Testing Plant communication module..."
+	cd plant/app && $(UV) run python test_plant_communication.py --duration 15
+	@echo "Plant communication test complete."
+
+# Test Numeric communication module only
+test-numeric-comm:
+	@echo "Testing Numeric communication module..."
+	cd numeric/app && $(UV) run python test_numeric_communication.py --duration 15
+	@echo "Numeric communication test complete."
+
 # Restart the simulation (generates new RUN_ID)
 restart: down
 	@$(MAKE) up
@@ -127,6 +156,18 @@ analyze:
 	$(UV) run python scripts/hils_analyzer.py visualize
 	@echo "Analysis complete."
 
+# Communication structure analysis
+analyze-comm:
+	@echo "Running communication structure analysis..."
+	cd analysis && $(UV) run python communication_flow_analysis.py
+	@echo "Communication analysis complete."
+
+# Delay pattern comparison analysis
+analyze-delay:
+	@echo "Creating delay pattern comparison..."
+	cd analysis && $(UV) run python create_delay_comparison.py
+	@echo "Delay analysis complete."
+
 # Show log status
 logs-status:
 	$(UV) run python scripts/hils_analyzer.py status
@@ -153,6 +194,11 @@ help:
 	@echo ""
 	@echo "  status    - Check container and service status"
 	@echo "  test      - Run a quick test simulation"
+	@echo ""
+	@echo "  test-comm - Test communication modules (no Docker)"
+	@echo "  test-comm-delay - Test communication with delay simulation"
+	@echo "  test-plant-comm - Test Plant communication module only"
+	@echo "  test-numeric-comm - Test Numeric communication module only"
 	@echo ""
 	@echo "  analyze   - Run integrated log analysis and visualization"
 	@echo "  logs-status - Show current log file status"
