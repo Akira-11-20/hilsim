@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
-import zmq
-import json
+"""
+Numeric シミュレーターメインファイル（新アーキテクチャ版）
+
+参考構造に基づくUDPクライアント実装。
+PID制御器でPlant側に制御コマンドを送信し、
+状態データを受信してRTT測定・ログ記録を行う。
+
+主要機能：
+- AltitudePIDController: 高度制御PID制御器
+- UDP Client: リクエスト・レスポンス通信
+- RTT測定・統計
+- ログ記録・分析
+"""
+
+import socket
 import yaml
 import numpy as np
 import pandas as pd
@@ -9,7 +22,11 @@ import sys
 import time
 import csv
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+# 新プロトコルをインポート
+sys.path.append('/app')
+from shared.protocol import ProtocolHandler, RequestPacket, ResponsePacket, create_request_packet
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -66,36 +83,70 @@ class AltitudePIDController:
         
         return output
 
-class NumericSimulator:
+class NumericClient:
+    """
+    Numeric UDP クライアントクラス（新アーキテクチャ版）
+
+    参考構造に基づくUDPクライアント実装。
+    Plant側にUDPリクエストを送信し、RTT測定を行う。
+
+    主要機能：
+    - UDP Client（リクエスト・レスポンス通信）
+    - PID制御器（AltitudePIDController）
+    - RTT測定・統計
+    - ログ記録・分析
+    """
+
     def __init__(self, config_file: str = "config.yaml"):
         self.load_config(config_file)
-        self.setup_zmq()
         self.setup_controller()
         self.setup_logging()
+        self.setup_udp_client()
         self.load_scenario()
         
     def load_config(self, config_file: str):
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
-        
-        # Override with environment variables
-        self.plant_endpoint = os.getenv('PLANT_ENDPOINT', self.config['numeric']['plant_endpoint'])
+
+        # UDP通信設定
+        self.plant_host = os.getenv('PLANT_HOST', 'plant')  # Plantサーバーホスト
+        self.plant_port = int(os.getenv('PLANT_PORT', 5005))  # Plantサーバーポート
+        self.timeout_s = float(os.getenv('TIMEOUT_S', 1.0))  # タイムアウト[秒]
+
+        # シミュレーション設定
         self.dt = float(os.getenv('STEP_DT', self.config['numeric']['dt']))
         self.max_steps = int(os.getenv('MAX_STEPS', self.config['numeric']['max_steps']))
-        self.timeout_ms = self.config['numeric']['timeout_ms']
-        
-        # Create timestamped log directory
-        run_id = os.getenv('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
-        log_dir = f"/app/logs/{run_id}"
+        self.rate_hz = float(os.getenv('RATE_HZ', 50))  # 送信周波数[Hz]
+
+        # 新しい日付ベースログディレクトリ設定
+        log_date_dir = os.getenv('LOG_DATE_DIR')
+        log_description = os.getenv('LOG_DESCRIPTION', 'test')
+
+        if log_date_dir:
+            # 環境変数からのパス（Docker内）
+            log_dir = f"/app/logs/{log_date_dir}"
+        else:
+            # フォールバック: 従来形式
+            date_str = time.strftime('%Y-%m-%d')
+            time_str = time.strftime('%H%M%S')
+            log_dir = f"/app/logs/{date_str}/{time_str}_{log_description}"
+
+        print(f"Numeric log directory: {log_dir}")
+        os.makedirs(log_dir, exist_ok=True)
         self.log_file = f"{log_dir}/numeric_log.csv"
         
-    def setup_zmq(self):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-        self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
-        self.socket.connect(self.plant_endpoint)
-        logger.info(f"Connected to plant at {self.plant_endpoint}")
+    def setup_udp_client(self):
+        """UDPクライアント設定"""
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.settimeout(self.timeout_s)
+        logger.info(f"UDP client configured for {self.plant_host}:{self.plant_port}")
+
+        # 統計情報
+        self.sent_count = 0
+        self.received_count = 0
+        self.timeout_count = 0
+        self.rtt_history = []
+        self.start_time = time.time()
         
     def setup_controller(self):
         ctrl_config = self.config['controller']
@@ -111,8 +162,8 @@ class NumericSimulator:
         self.log_fp = open(self.log_file, 'w', newline='')
         self.csv_writer = csv.writer(self.log_fp)
         self.csv_writer.writerow(['seq', 't', 'send_time', 'recv_time', 'rtt_ms',
-                                 'thrust_cmd', 'altitude', 'velocity', 'acceleration',
-                                 'altitude_error', 'setpoint'])
+                                 'fx', 'fy', 'fz', 'altitude', 'velocity', 'acceleration',
+                                 'altitude_error', 'setpoint', 'timeout'])
     
     def load_scenario(self):
         self.scenario = None
@@ -123,168 +174,226 @@ class NumericSimulator:
                 self.scenario = pd.read_csv(scenario_file)
                 logger.info(f"Loaded scenario from {scenario_file}")
     
-    def get_command(self, step: int, current_altitude: float) -> List[float]:
-        """Generate thrust command for altitude control - simplified"""
-        # 質量は設定から取得（通常は1.0kg）
-        mass = 1.0  # または self.config から取得可能
+    def get_command(self, step: int, current_altitude: float) -> Tuple[float, float, float]:
+        """制御コマンド生成（新アーキテクチャ版）"""
+        # 質量・重力定数
+        mass = 1.0
         gravity = 9.81
-        
+
         if self.scenario is not None:
-            # Find the appropriate scenario command for this step
+            # シナリオベースの制御
             scenario_row = None
             for _, row in self.scenario.iterrows():
                 if row['step'] <= step:
                     scenario_row = row
                 else:
                     break
-            
+
             if scenario_row is not None:
                 cmd_type = scenario_row.get('cmd_type', 'position')
-                cmd_z = scenario_row.get('cmd_z', 10.0)  # Default altitude
-                
+                cmd_z = scenario_row.get('cmd_z', 10.0)
+
                 if cmd_type == 'force':
-                    # Direct thrust command
-                    thrust = cmd_z
-                    return [0.0, 0.0, thrust]
-                else:  # cmd_type == 'position' or default
-                    # Altitude setpoint command - use PID controller
+                    # 直接推力指令
+                    return (0.0, 0.0, cmd_z)
+                else:
+                    # 高度設定値 - PID制御
                     self.controller.setpoint = cmd_z
                     pid_output = self.controller.update(current_altitude, self.dt)
-                    thrust = pid_output + mass * gravity  # 正しい重力補償
-                    return [0.0, 0.0, thrust]
-        
-        # Default: PID controller with proper gravity compensation
+                    thrust = pid_output + mass * gravity
+                    return (0.0, 0.0, thrust)
+
+        # デフォルト: PID制御（重力補償付き）
         pid_output = self.controller.update(current_altitude, self.dt)
-        thrust = pid_output + mass * gravity  # mg分の重力補償
-        
-        # 推力制限（現実的な範囲）
-        max_thrust = 1000.0  # 最大推力 [N]
+        thrust = pid_output + mass * gravity
+
+        # 推力制限
+        max_thrust = 1000.0
         thrust = np.clip(thrust, 0, max_thrust)
-        
-        return [0.0, 0.0, thrust]
+
+        return (0.0, 0.0, thrust)
     
-    def send_receive(self, seq: int, t: float, command: List[float]) -> Optional[Dict]:
-        """Send command and receive response"""
+    def send_receive_udp(self, seq: int, sim_time: float, fx: float, fy: float, fz: float) -> Optional[Dict]:
+        """UDPリクエスト・レスポンス通信"""
         try:
-            request = {
-                "seq": seq,
-                "t": t,
-                "u": command
-            }
-            
+            # リクエストパケット生成
+            request = create_request_packet(seq, fx, fy, fz)
+            request_data = ProtocolHandler.pack_request(request)
+
+            # 高精度RTT測定開始
             send_time = time.time()
-            perf_start = time.perf_counter()  # 高精度相対時間計測
-            self.socket.send_json(request)
-            
-            response = self.socket.recv_json()
+            perf_start = time.perf_counter()
+
+            # UDP送信
+            self.socket.sendto(request_data, (self.plant_host, self.plant_port))
+            self.sent_count += 1
+
+            # UDP受信
+            response_data, addr = self.socket.recvfrom(1024)
             recv_time = time.time()
-            rtt_ms = (time.perf_counter() - perf_start) * 1000  # 必ず正の値
-            
+            rtt_ms = (time.perf_counter() - perf_start) * 1000
+
+            # レスポンスパケット解析
+            response = ProtocolHandler.unpack_response(response_data)
+            if not response:
+                logger.warning(f"Invalid response packet from {addr}")
+                return None
+
+            self.received_count += 1
+            self.rtt_history.append(rtt_ms)
+
+            # RTT履歴管理（最新1000件）
+            if len(self.rtt_history) > 1000:
+                self.rtt_history = self.rtt_history[-500:]
+
             return {
                 'response': response,
                 'send_time': send_time,
                 'recv_time': recv_time,
-                'rtt_ms': rtt_ms
+                'rtt_ms': rtt_ms,
+                'timeout': False
             }
-            
-        except zmq.Again:
-            logger.error(f"Timeout on step {seq}")
-            return None
+
+        except socket.timeout:
+            logger.warning(f"Timeout on step {seq}")
+            self.timeout_count += 1
+            return {'timeout': True}
         except Exception as e:
             logger.error(f"Communication error on step {seq}: {e}")
             return None
     
     def run(self):
-        logger.info(f"Numeric simulator started, will run {self.max_steps} steps")
-        
-        # State tracking
+        """UDPクライアントメイン実行（新アーキテクチャ版）"""
+        logger.info(f"Numeric UDP client started: {self.max_steps} steps at {self.rate_hz} Hz")
+        logger.info(f"Target: {self.plant_host}:{self.plant_port}, timeout: {self.timeout_s}s")
+
+        # 状態追跡変数
         current_altitude = 0.0
         sim_time = 0.0
         successful_steps = 0
         failed_steps = 0
-        
+
         try:
+            step_interval = 1.0 / self.rate_hz  # ステップ間隔[s]
+
             for step in range(self.max_steps):
-                # Generate control command (thrust)
-                command = self.get_command(step, current_altitude)
-                
-                # Communication with plant
-                result = self.send_receive(step, sim_time, command)
-                
+                step_start = time.perf_counter()
+
+                # 制御コマンド生成
+                fx, fy, fz = self.get_command(step, current_altitude)
+
+                # UDP通信実行
+                result = self.send_receive_udp(step, sim_time, fx, fy, fz)
+
+                timeout = False
                 if result is None:
                     failed_steps += 1
-                    logger.warning(f"Step {step} failed")
+                    logger.warning(f"Step {step} communication failed")
                     continue
-                
-                response = result['response']
-                
-                # Extract plant response
-                if not response.get('valid', False):
+                elif result.get('timeout', False):
                     failed_steps += 1
-                    logger.warning(f"Plant returned invalid response at step {step}")
+                    timeout = True
+                    # タイムアウト時もログに記録
+                    if self.csv_writer:
+                        self.csv_writer.writerow([
+                            step, sim_time, 0, 0, 0,  # タイムスタンプ・RTTは0
+                            fx, fy, fz, current_altitude, 0, 0,  # 前回の値を使用
+                            0, self.controller.setpoint, True
+                        ])
+                        self.log_fp.flush()
                     continue
-                
-                y = response['y']
-                plant_pos = y.get('position', [0.0, 0.0, 0.0])
-                plant_vel = y.get('velocity', [0.0, 0.0, 0.0])
-                plant_acc = y.get('acc', [0.0, 0.0, 0.0])
-                
-                # Extract altitude (Z-axis)
-                current_altitude = plant_pos[2]
-                current_velocity = plant_vel[2]
-                current_acceleration = plant_acc[2]
-                
-                # Calculate altitude error
+
+                response = result['response']
+
+                # Plant応答から状態データ抽出
+                current_altitude = response.pos_z
+                current_velocity = response.vel_z
+                current_acceleration = response.acc_z
+
+                # 高度誤差計算
                 altitude_error = self.controller.setpoint - current_altitude
-                
-                # Log data
+
+                # ログ記録
                 if self.csv_writer:
                     self.csv_writer.writerow([
                         step, sim_time, result['send_time'], result['recv_time'], result['rtt_ms'],
-                        command[2],  # thrust_cmd
-                        current_altitude, current_velocity, current_acceleration,
-                        altitude_error, self.controller.setpoint
+                        fx, fy, fz, current_altitude, current_velocity, current_acceleration,
+                        altitude_error, self.controller.setpoint, timeout
                     ])
                     self.log_fp.flush()
-                
+
                 successful_steps += 1
                 sim_time += self.dt
-                
-                # Progress logging
+
+                # 進捗表示（100ステップ毎）
                 if (step + 1) % 100 == 0:
-                    logger.info(f"Completed {step + 1}/{self.max_steps} steps, RTT: {result['rtt_ms']:.2f}ms")
-                    
+                    avg_rtt = np.mean(self.rtt_history[-100:]) if len(self.rtt_history) >= 100 else 0
+                    logger.info(f"Step {step + 1}/{self.max_steps}, RTT: {result['rtt_ms']:.2f}ms (avg: {avg_rtt:.2f}ms), Alt: {current_altitude:.2f}m")
+
+                # レート制御（固定周期実行）
+                elapsed = time.perf_counter() - step_start
+                sleep_time = step_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
         except KeyboardInterrupt:
             logger.info("Shutdown requested")
         except Exception as e:
             logger.error(f"Error in main loop: {e}")
         finally:
             self.cleanup()
-            
-        logger.info(f"Simulation completed: {successful_steps} successful, {failed_steps} failed")
-        
-        # Print completion notification to stdout (visible in docker logs)
-        import sys
+
+        # 統計表示
+        self.print_final_statistics(successful_steps, failed_steps)
+
+    def print_final_statistics(self, successful_steps: int, failed_steps: int):
+        """最終統計の表示"""
+        total_time = time.time() - self.start_time
+        success_rate = successful_steps / (successful_steps + failed_steps) * 100 if (successful_steps + failed_steps) > 0 else 0
+
+        # RTT統計
+        rtt_stats = {}
+        if len(self.rtt_history) > 0:
+            rtt_stats = {
+                'mean': np.mean(self.rtt_history),
+                'std': np.std(self.rtt_history),
+                'min': np.min(self.rtt_history),
+                'max': np.max(self.rtt_history),
+                'p95': np.percentile(self.rtt_history, 95)
+            }
+
+        logger.info(f"Simulation completed: {successful_steps} successful, {failed_steps} failed ({success_rate:.1f}% success rate)")
+        logger.info(f"Communication stats: sent={self.sent_count}, received={self.received_count}, timeouts={self.timeout_count}")
+        if rtt_stats:
+            logger.info(f"RTT stats: {rtt_stats['mean']:.2f}±{rtt_stats['std']:.2f}ms [{rtt_stats['min']:.2f}-{rtt_stats['max']:.2f}ms] P95={rtt_stats['p95']:.2f}ms")
+
+        # コンソール出力
         completion_msg = f"""
 {'='*60}
 🚀 HILS SIMULATION COMPLETED 🚀
 {'='*60}
-Steps: {successful_steps}/{self.max_steps} successful ({successful_steps/self.max_steps*100:.1f}%)
-Communication: {failed_steps} failures
+Steps: {successful_steps}/{successful_steps + failed_steps} successful ({success_rate:.1f}%)
+Communication: {self.sent_count} sent, {self.received_count} received, {self.timeout_count} timeouts
+Runtime: {total_time:.1f}s
 {'='*60}
 📊 Run 'make analyze' to view results
 {'='*60}
 """
         print(completion_msg, flush=True)
-        sys.stdout.flush()
         
     def cleanup(self):
+        """リソース解放"""
         if hasattr(self, 'log_fp'):
             self.log_fp.close()
-        self.socket.close()
-        self.context.term()
-        logger.info("Numeric simulator stopped")
+        if hasattr(self, 'socket'):
+            self.socket.close()
+        logger.info("Numeric client stopped")
 
 if __name__ == "__main__":
-    simulator = NumericSimulator()
-    simulator.run()
+    """
+    メインエントリポイント
+
+    新アーキテクチャ版：UDP Client として動作
+    """
+    client = NumericClient()
+    client.run()

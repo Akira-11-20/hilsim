@@ -17,6 +17,7 @@ import zmq
 import time
 import numpy as np
 import logging
+import json
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -59,40 +60,86 @@ class PlantCommunicator:
         self.is_synchronized = False # 同期状態フラグ
 
         # ===== RTT測定 =====
-        self.latest_command_timestamp = 0.0  # 最新コマンドのタイムスタンプ
-        self.latest_command_seq = -1         # 最新コマンドのシーケンス番号
+        self.latest_command_timestamp = 0.0      # 最新コマンドのタイムスタンプ
+        self.latest_command_sync_timestamp = 0.0 # 最新コマンドの同期タイムスタンプ
+        self.latest_command_seq = -1             # 最新コマンドのシーケンス番号
 
-        # ===== 通信遅延シミュレーション =====
+        # ===== 通信遅延シミュレーション（enhanced） =====
         self.enable_delay = False      # 遅延シミュレーション有効/無効
-        self.processing_delay = 0.0    # 処理遅延[s]
-        self.response_delay = 0.0      # 応答遅延[s]
-        self.delay_variation = 0.0     # 遅延変動[s]
+        self.base_delay_ms = 0.0       # 基本処理遅延[ms]
+        self.network_delay_ms = 0.0    # ネットワーク遅延[ms]
+        self.jitter_ms = 0.0           # ジッタ振幅[ms]
+        self.jitter_type = "uniform"   # ジッタ分布型（uniform/gaussian/exponential）
         self.command_queue = []        # 遅延適用用コマンドキュー
+
+        # ===== 統計・分析 =====
+        self.message_count = 0         # メッセージ処理数
+        self.delay_history = []        # 遅延履歴（最近1000件）
+        self.stats_interval = 100      # 統計表示間隔
 
         logger.info(f"PlantCommunicator setup: PUB on :{state_pub_port}, SUB on {cmd_sub_endpoint}")
 
         # ZeroMQ接続確立待ち
         time.sleep(1.0)
 
-    def configure_delay_simulation(self, enable: bool, processing_delay_ms: float = 0.0,
-                                 response_delay_ms: float = 0.0, delay_variation_ms: float = 0.0):
+    def configure_delay_simulation(self, enable: bool, base_delay_ms: float = 0.0,
+                                 network_delay_ms: float = 0.0, jitter_ms: float = 0.0,
+                                 jitter_type: str = "uniform"):
         """
-        通信遅延シミュレーション設定
+        通信遅延シミュレーション設定（enhanced版）
 
         Args:
             enable: 遅延シミュレーション有効化
-            processing_delay_ms: 処理遅延[ms]
-            response_delay_ms: 応答遅延[ms]
-            delay_variation_ms: 遅延変動[ms]
+            base_delay_ms: 基本処理遅延[ms]
+            network_delay_ms: ネットワーク遅延[ms]
+            jitter_ms: ジッタ振幅[ms]
+            jitter_type: ジッタ分布型（uniform/gaussian/exponential）
         """
         self.enable_delay = enable
-        self.processing_delay = processing_delay_ms / 1000.0  # ms → s
-        self.response_delay = response_delay_ms / 1000.0      # ms → s
-        self.delay_variation = delay_variation_ms / 1000.0    # ms → s
+        self.base_delay_ms = base_delay_ms
+        self.network_delay_ms = network_delay_ms
+        self.jitter_ms = jitter_ms
+        self.jitter_type = jitter_type
+
+        total_fixed_delay = base_delay_ms + network_delay_ms
 
         if self.enable_delay:
-            logger.info(f"Communication delay enabled: processing={processing_delay_ms:.1f}ms, "
-                       f"response={response_delay_ms:.1f}ms, variation={delay_variation_ms:.1f}ms")
+            logger.info(f"Enhanced delay simulation enabled:")
+            logger.info(f"  Base Processing: {base_delay_ms:.1f}ms")
+            logger.info(f"  Network Simulation: {network_delay_ms:.1f}ms")
+            logger.info(f"  Jitter: {jitter_ms:.1f}ms ({jitter_type})")
+            logger.info(f"  Total Fixed: {total_fixed_delay:.1f}ms")
+
+    def generate_jitter(self):
+        """ジッタ生成（communication_test_containersと同じアルゴリズム）"""
+        if self.jitter_ms <= 0:
+            return 0.0
+
+        if self.jitter_type == "uniform":
+            return np.random.uniform(-self.jitter_ms, self.jitter_ms)
+        elif self.jitter_type == "gaussian":
+            return np.random.normal(0, self.jitter_ms / 3.0)  # 3σ = jitter_ms
+        elif self.jitter_type == "exponential":
+            return np.clip(np.random.exponential(self.jitter_ms / 2.0), 0, self.jitter_ms)
+        else:
+            return 0.0
+
+    def apply_delay(self, delay_ms):
+        """高精度遅延適用"""
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+
+    def print_delay_statistics(self):
+        """遅延統計表示"""
+        if len(self.delay_history) > 0:
+            recent_delays = self.delay_history[-self.stats_interval:]
+            avg_delay = np.mean(recent_delays)
+            std_delay = np.std(recent_delays)
+            min_delay = np.min(recent_delays)
+            max_delay = np.max(recent_delays)
+
+            logger.info(f"Plant delay stats (last {len(recent_delays)}): "
+                       f"{avg_delay:.2f}±{std_delay:.2f}ms [{min_delay:.2f}-{max_delay:.2f}ms]")
 
     def get_sync_timestamp(self) -> float:
         """
@@ -185,28 +232,39 @@ class PlantCommunicator:
                     if self.handle_sync_protocol(cmd_msg):
                         continue
 
-                    # RTT測定用データ更新
+                    # RTT測定用データ更新（遅延処理に関係なく即座に記録）
                     self.latest_command_timestamp = cmd_msg.get('timestamp', recv_time)
+                    # 受信時点での同期タイムスタンプを記録（遅延シミュレーションは適用しない）
+                    if self.is_synchronized:
+                        self.latest_command_sync_timestamp = self.get_sync_timestamp()
+                    else:
+                        self.latest_command_sync_timestamp = cmd_msg.get('sync_timestamp', 0.0)
                     self.latest_command_seq = cmd_msg.get('seq', 0)
 
                     control_input = cmd_msg.get('u', [0.0, 0.0, 0.0])
 
                     if self.enable_delay:
-                        # ===== 遅延シミュレーション =====
-                        total_delay = self.processing_delay + self.response_delay
-                        if self.delay_variation > 0:
-                            # 遅延変動を追加
-                            total_delay += np.random.uniform(-self.delay_variation, self.delay_variation)
+                        # ===== Simple遅延シミュレーション（communication_test_containersスタイル）=====
+                        # ジッタ生成
+                        jitter = self.generate_jitter()
+                        total_delay_ms = self.base_delay_ms + self.network_delay_ms + jitter
 
-                        # 遅延キューに追加
-                        apply_time = recv_time + total_delay
-                        self.command_queue.append({
-                            'control_input': control_input,
-                            'apply_time': apply_time,
-                            'seq': cmd_msg.get('seq', 0),
-                            'original_timestamp': self.latest_command_timestamp
-                        })
-                        return None  # 遅延適用のため即座には返さない
+                        # 遅延適用（シンプルに全体遅延を一度に適用）
+                        self.apply_delay(total_delay_ms)
+
+                        # 統計更新
+                        self.delay_history.append(total_delay_ms)
+                        self.message_count += 1
+
+                        # メモリ管理：最新1000件まで保持
+                        if len(self.delay_history) > 1000:
+                            self.delay_history = self.delay_history[-500:]
+
+                        # 定期的統計表示
+                        if self.message_count % self.stats_interval == 0:
+                            self.print_delay_statistics()
+
+                        return control_input  # 遅延適用後に返す
                     else:
                         # ===== 即座適用 =====
                         return control_input
@@ -218,32 +276,6 @@ class PlantCommunicator:
             logger.warning(f"Error receiving commands: {e}")
 
         return None
-
-    def process_delayed_commands(self) -> Optional[List[float]]:
-        """
-        遅延キューから適用時刻に達したコマンドを処理
-
-        Returns:
-            適用すべき制御コマンド [fx, fy, fz] or None
-        """
-        if not self.enable_delay:
-            return None
-
-        current_time = time.time()
-        applied_command = None
-
-        # 適用時刻に達したコマンドを探す
-        commands_to_remove = []
-        for cmd in self.command_queue:
-            if current_time >= cmd['apply_time']:
-                applied_command = cmd['control_input']
-                commands_to_remove.append(cmd)
-
-        # 適用済みコマンドを削除
-        for cmd in commands_to_remove:
-            self.command_queue.remove(cmd)
-
-        return applied_command
 
     def broadcast_state(self, seq: int, sim_time: float, state_data: Dict):
         """
@@ -258,11 +290,12 @@ class PlantCommunicator:
         effective_timestamp = current_time
 
         # 応答遅延シミュレーション（RTT計算への影響なしでタイムスタンプ調整）
-        if self.enable_delay and self.response_delay > 0:
-            delay_time = self.response_delay
-            if self.delay_variation > 0:
-                delay_time += np.random.uniform(-self.delay_variation, self.delay_variation)
-            effective_timestamp = current_time + delay_time
+        if self.enable_delay and self.network_delay_ms > 0:
+            delay_time_ms = self.network_delay_ms + self.generate_jitter()
+            effective_timestamp = current_time + (delay_time_ms / 1000.0)
+
+        # RTT測定用の正確なタイムスタンプ（遅延シミュレーションの影響を除く）
+        rtt_timestamp = current_time if not self.enable_delay else current_time
 
         # 状態データメッセージ構築
         state_msg = {
@@ -270,11 +303,12 @@ class PlantCommunicator:
             "t": sim_time,                                # シミュレーション時刻
             "y": state_data,                              # 状態データ
             "valid": True,                                # データ有効性フラグ
-            "timestamp": effective_timestamp,             # 有効タイムスタンプ（RTT計算用）
-            "sync_timestamp": self.get_sync_timestamp(),  # 同期タイムスタンプ
+            "timestamp": rtt_timestamp,                   # RTT計算用タイムスタンプ（遅延無し）
+            "sync_timestamp": self.get_sync_timestamp(),  # 現在の同期タイムスタンプ
             "is_synchronized": self.is_synchronized,      # 同期状態
             # RTT測定用データ
             "latest_cmd_timestamp": self.latest_command_timestamp,
+            "latest_cmd_sync_timestamp": self.latest_command_sync_timestamp,
             "latest_cmd_seq": self.latest_command_seq
         }
 
@@ -323,16 +357,26 @@ class PlantCommunicationManager:
         # PlantCommunicator初期化
         self.communicator = PlantCommunicator(state_pub_port, cmd_sub_endpoint)
 
-        # 遅延シミュレーション設定
+        # Enhanced遅延シミュレーション設定
         comm_config = self.config.get('communication', {})
         if comm_config:
             enable_delay = comm_config.get('enable_delay', False)
-            processing_delay = comm_config.get('processing_delay', 0.0)
-            response_delay = comm_config.get('response_delay', 0.0)
-            delay_variation = comm_config.get('delay_variation', 0.0)
+            # 新しいパラメータ構成
+            base_delay = comm_config.get('base_delay_ms', 0.0)
+            network_delay = comm_config.get('network_delay_ms', 0.0)
+            jitter = comm_config.get('jitter_ms', 0.0)
+            jitter_type = comm_config.get('jitter_type', 'uniform')
+
+            # 後方互換性：古いパラメータが設定されている場合
+            if 'processing_delay' in comm_config:
+                base_delay = comm_config.get('processing_delay', 0.0)
+            if 'response_delay' in comm_config:
+                network_delay = comm_config.get('response_delay', 0.0)
+            if 'delay_variation' in comm_config:
+                jitter = comm_config.get('delay_variation', 0.0)
 
             self.communicator.configure_delay_simulation(
-                enable_delay, processing_delay, response_delay, delay_variation
+                enable_delay, base_delay, network_delay, jitter, jitter_type
             )
 
         return self.communicator

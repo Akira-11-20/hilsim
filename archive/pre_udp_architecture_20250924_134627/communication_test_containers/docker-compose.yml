@@ -1,0 +1,90 @@
+version: '3.8'
+
+services:
+  # Default bridge network test
+  server-bridge:
+    build: ./server
+    container_name: comm-server-bridge
+    networks:
+      - bridge-net
+    ports:
+      - "5557:5555"
+
+  client-bridge:
+    build: ./client
+    container_name: comm-client-bridge
+    depends_on:
+      - server-bridge
+    networks:
+      - bridge-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-bridge:5555
+      - SAMPLES=500
+      - TEST_NAME=bridge_network
+    volumes:
+      - ./results:/app/results
+    command: python client.py
+
+  # Host network test (low latency)
+  server-host:
+    build: ./server
+    container_name: comm-server-host
+    network_mode: host
+    profiles: ["host"]
+
+  client-host:
+    build: ./client
+    container_name: comm-client-host
+    depends_on:
+      - server-host
+    network_mode: host
+    profiles: ["host"]
+    environment:
+      - SERVER_ENDPOINT=tcp://127.0.0.1:5555
+      - SAMPLES=500
+      - TEST_NAME=host_network
+    volumes:
+      - ./results:/app
+    command: python client.py
+
+  # Custom network with optimizations
+  server-optimized:
+    build: ./server
+    container_name: comm-server-optimized
+    networks:
+      optimized-net:
+        aliases:
+          - server
+    ports:
+      - "5556:5555"
+    profiles: ["optimized"]
+
+  client-optimized:
+    build: ./client
+    container_name: comm-client-optimized
+    depends_on:
+      - server-optimized
+    networks:
+      - optimized-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server:5555
+      - SAMPLES=500
+      - TEST_NAME=optimized_network
+    volumes:
+      - ./results:/app
+    command: python client.py
+    profiles: ["optimized"]
+
+networks:
+  bridge-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1500
+
+  optimized-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "9000"  # Jumbo frames
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.host_binding_ipv4: "0.0.0.0"

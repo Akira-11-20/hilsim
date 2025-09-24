@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  fixed-plant:
+    build: ../plant
+    container_name: fixed-plant
+    networks:
+      - fixed-hilsnet
+    volumes:
+      - ../logs:/app/logs
+    command: python plant_server.py
+
+  fixed-numeric:
+    build: ../numeric
+    container_name: fixed-numeric
+    depends_on:
+      - fixed-plant
+    networks:
+      - fixed-hilsnet
+    volumes:
+      - ../logs:/app/logs
+    environment:
+      - PLANT_ENDPOINT=tcp://fixed-plant:5555
+    command: python numeric_client.py
+
+networks:
+  fixed-hilsnet:
+    driver: bridge

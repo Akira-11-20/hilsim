@@ -3,6 +3,9 @@
 # UV-based Python dependency management
 UV := $(shell which uv 2>/dev/null || echo "uv-not-found")
 
+# Default Docker Compose file (override with `make COMPOSE_FILE=...`)
+COMPOSE_FILE ?= docker-compose.yml
+
 # Setup Python dependencies with uv
 setup:
 	@echo "Setting up Python environment with uv..."
@@ -23,7 +26,7 @@ setup-dev: setup
 # Build all Docker images
 build:
 	@echo "Building HILS Docker containers..."
-	docker compose -f docker/compose.yaml build
+	docker compose -f $(COMPOSE_FILE) build
 
 # Start the HILS simulation and wait for completion
 up:
@@ -31,14 +34,14 @@ up:
 	@export RUN_ID=$$(date +%Y%m%d_%H%M%S) && \
 	echo "Run ID: $$RUN_ID" && \
 	echo "⏳ Running simulation... (This will take ~40 seconds)" && \
-	RUN_ID=$$RUN_ID docker compose -f docker/compose.yaml up
+	RUN_ID=$$RUN_ID docker compose -f $(COMPOSE_FILE) up
 
 # Start the HILS simulation in background (detached mode)
 up-bg:
 	@echo "Starting HILS simulation in background..."
 	@export RUN_ID=$$(date +%Y%m%d_%H%M%S) && \
 	echo "Run ID: $$RUN_ID" && \
-	RUN_ID=$$RUN_ID docker compose -f docker/compose.yaml up -d
+	RUN_ID=$$RUN_ID docker compose -f $(COMPOSE_FILE) up -d
 	@echo "Waiting for services to be ready..."
 	@sleep 5
 	@docker inspect hils-plant --format='Plant: {{.State.Health.Status}}' 2>/dev/null >/dev/null && \
@@ -48,24 +51,24 @@ up-bg:
 # Stop the HILS simulation
 down:
 	@echo "Stopping HILS simulation..."
-	docker compose -f docker/compose.yaml down
+	docker compose -f $(COMPOSE_FILE) down
 
 # Show logs from all services
 logs:
-	docker compose -f docker/compose.yaml logs -f --tail=200
+	docker compose -f $(COMPOSE_FILE) logs -f --tail=200
 
 # Show logs from plant only
 logs-plant:
-	docker compose -f docker/compose.yaml logs -f --tail=100 plant
+	docker compose -f $(COMPOSE_FILE) logs -f --tail=100 plant
 
 # Show logs from numeric only
 logs-numeric:
-	docker compose -f docker/compose.yaml logs -f --tail=100 numeric
+	docker compose -f $(COMPOSE_FILE) logs -f --tail=100 numeric
 
 # Check status of services
 status:
 	@echo "=== Container Status ==="
-	docker compose -f docker/compose.yaml ps
+	docker compose -f $(COMPOSE_FILE) ps
 	@echo ""
 	@echo "=== Health Checks ==="
 	@docker inspect hils-plant --format='Plant: {{.State.Health.Status}}' 2>/dev/null || echo "Plant: Not running"
@@ -76,7 +79,7 @@ status:
 # Clean up containers and images
 clean:
 	@echo "Cleaning up Docker resources..."
-	docker compose -f docker/compose.yaml down --rmi all --volumes
+	docker compose -f $(COMPOSE_FILE) down --rmi all --volumes
 	docker system prune -f
 
 # Run a quick test simulation
@@ -139,11 +142,11 @@ monitor:
 		echo "Time: $$(date)"; \
 		echo ""; \
 		echo "Container Status:"; \
-		docker compose -f docker/compose.yaml ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"; \
+		docker compose -f $(COMPOSE_FILE) ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}"; \
 		echo ""; \
 		echo "Recent Logs:"; \
-		docker compose -f docker/compose.yaml logs --tail=3 plant 2>/dev/null | grep -E "(INFO|ERROR|WARNING)" || echo "No recent plant logs"; \
-		docker compose -f docker/compose.yaml logs --tail=3 numeric 2>/dev/null | grep -E "(INFO|ERROR|WARNING)" || echo "No recent numeric logs"; \
+		docker compose -f $(COMPOSE_FILE) logs --tail=3 plant 2>/dev/null | grep -E "(INFO|ERROR|WARNING)" || echo "No recent plant logs"; \
+		docker compose -f $(COMPOSE_FILE) logs --tail=3 numeric 2>/dev/null | grep -E "(INFO|ERROR|WARNING)" || echo "No recent numeric logs"; \
 		echo ""; \
 		echo "Log Files:"; \
 		ls -la logs/ 2>/dev/null || echo "No logs directory"; \
@@ -155,6 +158,11 @@ analyze:
 	@echo "Running HILS analysis..."
 	$(UV) run python scripts/hils_analyzer.py visualize
 	@echo "Analysis complete."
+
+analyze-all:
+	@echo "Running full HILS analysis..."
+	$(UV) run python scripts/hils_analyzer.py analyze-all
+	@echo "Full analysis complete."
 
 # Communication structure analysis
 analyze-comm:
@@ -171,8 +179,6 @@ analyze-delay:
 # Show log status
 logs-status:
 	$(UV) run python scripts/hils_analyzer.py status
-
-
 
 # Show help
 help:

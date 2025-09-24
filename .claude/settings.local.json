@@ -3,7 +3,10 @@
     "allow": [
       "Bash(make:*)",
       "Bash(git add:*)",
-      "Bash(uv run:*)"
+      "Bash(uv run:*)",
+      "Bash(echo:*)",
+      "Bash(docker compose:*)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []

@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
 """
-HILS Integrated Log Management and Visualization System (New Architecture)
-
-Updated to work with new date-based log structure with full archived functionality:
-- logs/YYYY-MM-DD/HHMMSS_description/ structure support
-- Comprehensive dashboard with 8-panel analysis
-- Dual trajectory visualization (Plant vs Numeric)
-- Performance analysis with control metrics
-- RTT analysis and statistics
-- Phase portraits and control effort analysis
-
-Author: Claude Code
-Date: 2024-09-24
+HILS Integrated Log Management and Visualization System
 """
 import os
 import sys
@@ -26,17 +15,12 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import matplotlib.patches as patches
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import warnings
-
-# Warning suppression
-warnings.filterwarnings('ignore')
 
 class HILSAnalyzer:
     def __init__(self, log_dir="logs"):
         self.log_dir = Path(log_dir)
         self.config_file = Path("hils_analyzer_config.json")
-
+        
         # Default configuration
         self.config = {
             "visualization_dpi": 300,
@@ -44,16 +28,16 @@ class HILSAnalyzer:
             "colors": {
                 "primary": "#1f77b4",
                 "secondary": "#ff7f0e",
-                "success": "#2ca02c",
+                "success": "#2ca02c", 
                 "danger": "#d62728",
                 "warning": "#ff7f0e",
                 "info": "#17becf"
             }
         }
-
+        
         self.load_config()
         self.ensure_directories()
-
+        
     def load_config(self):
         """Load configuration from file"""
         if self.config_file.exists():
@@ -64,128 +48,60 @@ class HILSAnalyzer:
                 print(f"Loaded configuration from {self.config_file}")
             except Exception as e:
                 print(f"Warning: Could not load config file: {e}")
-
+                
     def save_config(self):
         """Save current configuration to file"""
         with open(self.config_file, 'w') as f:
             json.dump(self.config, f, indent=2)
         print(f"Configuration saved to {self.config_file}")
-
+        
     def ensure_directories(self):
         """Create necessary directories"""
         self.log_dir.mkdir(exist_ok=True)
-
+        
     def get_latest_run_dir(self):
-        """Get the latest run directory from new date-based structure"""
+        """Get the latest run directory"""
         if not self.log_dir.exists():
             return None
-
-        # Find all date directories (format: YYYY-MM-DD)
-        date_dirs = [d for d in self.log_dir.iterdir()
-                    if d.is_dir() and self._is_date_directory(d.name)]
-        if not date_dirs:
+            
+        # Find all run directories (format: YYYYMMDD_HHMMSS)
+        run_dirs = [d for d in self.log_dir.iterdir() if d.is_dir() and d.name.count('_') == 1]
+        if not run_dirs:
             return None
-
-        # Get the latest date
-        latest_date_dir = max(date_dirs, key=lambda x: x.name)
-
-        # Find all session directories within that date
-        session_dirs = [d for d in latest_date_dir.iterdir()
-                       if d.is_dir() and ('_' in d.name)]
-        if not session_dirs:
-            return None
-
-        # Return the most recent session
-        return max(session_dirs, key=lambda x: x.name)
-
-    def get_all_run_dirs(self, limit: int = None) -> List[Path]:
-        """Get all run directories sorted by most recent first"""
-        if not self.log_dir.exists():
-            return []
-
-        all_runs = []
-
-        # Find all date directories
-        date_dirs = [d for d in self.log_dir.iterdir()
-                    if d.is_dir() and self._is_date_directory(d.name)]
-
-        # Process each date directory
-        for date_dir in date_dirs:
-            session_dirs = [d for d in date_dir.iterdir()
-                           if d.is_dir() and ('_' in d.name)]
-
-            for session_dir in session_dirs:
-                # Check if it has log files
-                numeric_log = session_dir / "numeric_log.csv"
-                plant_log = session_dir / "plant_log.csv"
-
-                if numeric_log.exists() or plant_log.exists():
-                    # Get modification time for sorting
-                    mod_time = max(
-                        numeric_log.stat().st_mtime if numeric_log.exists() else 0,
-                        plant_log.stat().st_mtime if plant_log.exists() else 0
-                    )
-                    all_runs.append((session_dir, mod_time))
-
-        # Sort by modification time, most recent first
-        all_runs.sort(key=lambda x: x[1], reverse=True)
-
-        # Apply limit if specified
-        if limit:
-            all_runs = all_runs[:limit]
-
-        return [run[0] for run in all_runs]
-
-    def _is_date_directory(self, dirname: str) -> bool:
-        """Check if directory name is date format"""
-        try:
-            datetime.datetime.strptime(dirname, "%Y-%m-%d")
-            return True
-        except ValueError:
-            return False
-
+            
+        # Return the most recent one
+        return max(run_dirs, key=lambda x: x.name)
+    
     def get_log_files(self, run_dir=None, run_id=None):
         """Get list of log files from specific run directory or latest"""
         if run_id:
-            # Parse run_id as either full path or partial identifier
-            if '/' in run_id:
-                run_dir = Path(run_id)
-            else:
-                # Search for matching session across all dates
-                for date_dir in self.log_dir.iterdir():
-                    if date_dir.is_dir() and self._is_date_directory(date_dir.name):
-                        for session_dir in date_dir.iterdir():
-                            if session_dir.is_dir() and run_id in session_dir.name:
-                                run_dir = session_dir
-                                break
-                        if run_dir:
-                            break
-
-            if not run_dir or not run_dir.exists():
+            # Use specific run ID
+            run_dir = self.log_dir / run_id
+            if not run_dir.exists():
                 print(f"Run ID {run_id} not found")
                 return {}
         elif run_dir is None:
             run_dir = self.get_latest_run_dir()
-
+            
         if run_dir is None:
             return {}
-
+            
         # Check for both possible numeric log filenames
         numeric_file = run_dir / "numeric_log.csv"
         if not numeric_file.exists():
             numeric_file = run_dir / "realtime_numeric_log.csv"
-
+            
         files = {
             'numeric': numeric_file,
             'plant': run_dir / "plant_log.csv"
         }
         return {k: v for k, v in files.items() if v.exists()}
-
+        
     def get_log_info(self):
         """Get information about current log files"""
         log_files = self.get_log_files()
         info = {}
-
+        
         for name, path in log_files.items():
             stat = path.stat()
             info[name] = {
@@ -194,27 +110,28 @@ class HILSAnalyzer:
                 'modified': datetime.datetime.fromtimestamp(stat.st_mtime),
                 'lines': None
             }
-
+            
             # Count lines
             try:
                 with open(path, 'r') as f:
                     info[name]['lines'] = sum(1 for _ in f) - 1  # Subtract header
             except Exception as e:
                 info[name]['lines'] = f"Error: {e}"
-
+                
         return info
-
+        
+            
     def load_simulation_data(self, run_id=None):
         """Load and validate simulation data"""
         log_files = self.get_log_files(run_id=run_id)
-
+        
         if 'numeric' not in log_files:
             raise FileNotFoundError("numeric_log.csv not found")
-
+            
         # Load numeric data (required)
         self.numeric_data = pd.read_csv(log_files['numeric'])
         print(f"Loaded {len(self.numeric_data)} numeric data points")
-
+        
         # Load plant data (optional)
         self.plant_data = None
         if 'plant' in log_files:
@@ -223,56 +140,56 @@ class HILSAnalyzer:
                 print(f"Loaded {len(self.plant_data)} plant data points")
             except Exception as e:
                 print(f"Warning: Could not load plant data: {e}")
-
+        
         # Check if we have both datasets for dual trajectory analysis
         self.has_dual_trajectory = self.plant_data is not None
         if self.has_dual_trajectory:
             print("✅ Both Plant and Numeric trajectories available for comparison")
         else:
             print("ℹ️  Only Numeric trajectory available")
-
+                
         return True
-
+        
     def create_dashboard(self):
         """Create comprehensive analysis dashboard"""
         fig = plt.figure(figsize=(16, 12))
         gs = GridSpec(3, 3, figure=fig, hspace=0.35, wspace=0.3)
-
+        
         fig.suptitle('HILS Comprehensive Analysis Dashboard', fontsize=18, fontweight='bold')
-
+        
         # Data preparation
-        t = self.numeric_data['t'].values
+        t = self.numeric_data['sim_time'].values
         altitude = self.numeric_data['altitude'].values
-        fz = self.numeric_data['fz'].values  # thrust_cmd equivalent
+        thrust_cmd = self.numeric_data['thrust_cmd'].values
         velocity = self.numeric_data['velocity'].values
         altitude_error = self.numeric_data['altitude_error'].values
         setpoint = self.numeric_data['setpoint'].values
         rtt = self.numeric_data['rtt_ms'].values
-
+        
         colors = self.config['colors']
-
+        
         # 1. Altitude Control (main plot)
         ax1 = fig.add_subplot(gs[0, :2])
         ax1.plot(t, altitude, color=colors['primary'], linewidth=2.5, label='Actual Altitude')
         ax1.plot(t, setpoint, color=colors['danger'], linestyle='--', linewidth=2, label='Setpoint')
-        ax1.fill_between(t, altitude, setpoint, where=(altitude < setpoint), alpha=0.3,
+        ax1.fill_between(t, altitude, setpoint, where=(altitude < setpoint), alpha=0.3, 
                         color=colors['danger'], label='Below Target')
         ax1.set_xlabel('Time [s]')
         ax1.set_ylabel('Altitude [m]')
         ax1.set_title('Altitude Control Performance', fontweight='bold')
         ax1.legend()
         ax1.grid(True, alpha=0.3)
-
+        
         # 2. Control Commands (Thrust)
         ax2 = fig.add_subplot(gs[0, 2])
-        ax2.plot(t, fz, color=colors['success'], linewidth=2)
+        ax2.plot(t, thrust_cmd, color=colors['success'], linewidth=2)
         ax2.axhline(y=9.81, color='gray', linestyle=':', linewidth=2, label='Gravity Compensation')
         ax2.set_xlabel('Time [s]')
         ax2.set_ylabel('Thrust [N]')
         ax2.set_title('Thrust Commands', fontweight='bold')
         ax2.legend()
         ax2.grid(True, alpha=0.3)
-
+        
         # 3. Velocity Profile
         ax3 = fig.add_subplot(gs[1, 0])
         ax3.plot(t, velocity, color=colors['warning'], linewidth=2)
@@ -284,7 +201,7 @@ class HILSAnalyzer:
         ax3.set_title('Vertical Velocity', fontweight='bold')
         ax3.legend()
         ax3.grid(True, alpha=0.3)
-
+        
         # 4. Error Analysis
         ax4 = fig.add_subplot(gs[1, 1])
         ax4.plot(t, np.abs(altitude_error), color=colors['danger'], linewidth=2)
@@ -292,13 +209,13 @@ class HILSAnalyzer:
         ax4.set_ylabel('|Error| [m]')
         ax4.set_title('Control Error', fontweight='bold')
         ax4.grid(True, alpha=0.3)
-
+        
         # Error statistics
         mean_error = np.mean(np.abs(altitude_error))
-        ax4.text(0.05, 0.95, f'Mean: {mean_error:.2f}m\nFinal: {np.abs(altitude_error[-1]):.2f}m',
+        ax4.text(0.05, 0.95, f'Mean: {mean_error:.2f}m\nFinal: {np.abs(altitude_error[-1]):.2f}m', 
                 transform=ax4.transAxes, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
+        
         # 5. Communication Performance
         ax5 = fig.add_subplot(gs[1, 2])
         ax5.plot(t, rtt, color=colors['info'], linewidth=1, alpha=0.7)
@@ -306,14 +223,14 @@ class HILSAnalyzer:
         ax5.set_ylabel('RTT [ms]')
         ax5.set_title('Communication', fontweight='bold')
         ax5.grid(True, alpha=0.3)
-
+        
         # RTT statistics
         mean_rtt = np.mean(rtt)
         std_rtt = np.std(rtt)
-        ax5.text(0.05, 0.95, f'{mean_rtt:.2f}±{std_rtt:.2f}ms',
+        ax5.text(0.05, 0.95, f'{mean_rtt:.2f}±{std_rtt:.2f}ms', 
                 transform=ax5.transAxes, verticalalignment='top',
                 bbox=dict(boxstyle='round', facecolor='lightcyan', alpha=0.8))
-
+        
         # 6. Phase Portrait
         ax6 = fig.add_subplot(gs[2, 0])
         scatter = ax6.scatter(altitude, velocity, c=t, cmap='viridis', s=15, alpha=0.6)
@@ -321,10 +238,10 @@ class HILSAnalyzer:
         ax6.set_ylabel('Velocity [m/s]')
         ax6.set_title('Phase Portrait', fontweight='bold')
         ax6.grid(True, alpha=0.3)
-
+        
         # 7. Control Effort
         ax7 = fig.add_subplot(gs[2, 1])
-        control_effort = fz - 9.81
+        control_effort = thrust_cmd - 9.81
         ax7.plot(t, control_effort, color=colors['secondary'], linewidth=2)
         ax7.axhline(y=0, color='black', linestyle='-', alpha=0.5)
         ax7.fill_between(t, control_effort, 0, alpha=0.3, color=colors['secondary'])
@@ -332,85 +249,83 @@ class HILSAnalyzer:
         ax7.set_ylabel('Net Thrust [N]')
         ax7.set_title('Control Effort', fontweight='bold')
         ax7.grid(True, alpha=0.3)
-
+        
         # 8. Performance Summary
         ax8 = fig.add_subplot(gs[2, 2])
         ax8.axis('off')
-
+        
         # Performance metrics
-        setpoint_val = setpoint[0]
         metrics = [
             f"Simulation: {t[-1]:.2f}s ({len(t)} steps)",
-            f"Final Alt: {altitude[-1]:.2f}m (target: {setpoint_val:.0f}m)",
+            f"Final Alt: {altitude[-1]:.2f}m (target: 10m)",
             f"Alt Error: {altitude_error[-1]:.2f}m",
-            f"Max Speed: {np.max(np.abs(velocity)):.2f}m/s",
-            f"Thrust Range: {np.min(fz):.1f}-{np.max(fz):.1f}N",
+            f"Max Speed: {np.max(np.abs(velocity)):.2f}m/s", 
+            f"Thrust Range: {np.min(thrust_cmd):.1f}-{np.max(thrust_cmd):.1f}N",
             f"Comm: {mean_rtt:.2f}±{std_rtt:.2f}ms",
             f"Success Rate: 100%"
         ]
-
+        
         y_start = 0.9
         for i, metric in enumerate(metrics):
-            ax8.text(0.05, y_start - i*0.12, metric, transform=ax8.transAxes,
+            ax8.text(0.05, y_start - i*0.12, metric, transform=ax8.transAxes, 
                     fontsize=11, verticalalignment='top')
-
+                    
         ax8.set_title('Performance Summary', fontweight='bold', pad=20)
-
+        
         return fig
-
+        
     def create_trajectory_3d(self):
         """Create dual trajectory visualization (Plant vs Numeric)"""
         fig = plt.figure(figsize=(14, 10))
-
+        
         if self.has_dual_trajectory:
             # Dual trajectory plot
             gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
-
+            
             # Main trajectory comparison
             ax1 = fig.add_subplot(gs[0, :])
-
+            
             # Numeric trajectory (control system view)
             numeric_alt = self.numeric_data['altitude'].values
-            numeric_t = self.numeric_data['t'].values
+            numeric_t = self.numeric_data['sim_time'].values
             setpoint = self.numeric_data['setpoint'].values[0]
-
+            
             # Plant trajectory (actual physical state)
             plant_alt = self.plant_data['altitude'].values
-            # Convert plant time to relative time
-            plant_t = (self.plant_data['recv_time'].values - self.plant_data['recv_time'].values[0])
-
-            ax1.plot(numeric_t, numeric_alt, linewidth=2.5, label='Numeric (Control View)',
+            plant_t = self.plant_data['t'].values
+            
+            ax1.plot(numeric_t, numeric_alt, linewidth=2.5, label='Numeric (Control View)', 
                     color='#1f77b4', alpha=0.8)
-            ax1.plot(plant_t, plant_alt, linewidth=2.5, label='Plant (Actual Physical)',
+            ax1.plot(plant_t, plant_alt, linewidth=2.5, label='Plant (Actual Physical)', 
                     color='#ff7f0e', alpha=0.8)
-            ax1.axhline(y=setpoint, color='red', linestyle='--', linewidth=2,
+            ax1.axhline(y=setpoint, color='red', linestyle='--', linewidth=2, 
                        label=f'Target ({setpoint}m)')
-
+            
             # Mark important points
-            ax1.scatter([numeric_t[0]], [numeric_alt[0]], color='green', s=100,
+            ax1.scatter([numeric_t[0]], [numeric_alt[0]], color='green', s=100, 
                        marker='o', label='Start', zorder=5)
-            ax1.scatter([plant_t[-1]], [plant_alt[-1]], color='red', s=100,
+            ax1.scatter([plant_t[-1]], [plant_alt[-1]], color='red', s=100, 
                        marker='s', label='End', zorder=5)
-
+            
             ax1.set_xlabel('Time [s]')
             ax1.set_ylabel('Altitude [m]')
-            ax1.set_title('Dual Trajectory Comparison: Plant vs Numeric',
+            ax1.set_title('Dual Trajectory Comparison: Plant vs Numeric', 
                          fontsize=16, fontweight='bold')
             ax1.legend()
             ax1.grid(True, alpha=0.3)
-
+            
             # Trajectory difference analysis
             ax2 = fig.add_subplot(gs[1, 0])
-
+            
             # Interpolate for comparison (different sampling rates)
+            from scipy import interpolate
             try:
-                from scipy import interpolate
                 # Interpolate plant data to numeric time points
-                plant_interp = interpolate.interp1d(plant_t, plant_alt,
+                plant_interp = interpolate.interp1d(plant_t, plant_alt, 
                                                   bounds_error=False, fill_value='extrapolate')
                 plant_alt_synced = plant_interp(numeric_t)
                 trajectory_diff = numeric_alt - plant_alt_synced
-
+                
                 ax2.plot(numeric_t, trajectory_diff, color='purple', linewidth=2)
                 ax2.axhline(y=0, color='black', linestyle='-', alpha=0.5)
                 ax2.fill_between(numeric_t, trajectory_diff, 0, alpha=0.3, color='purple')
@@ -418,93 +333,88 @@ class HILSAnalyzer:
                 ax2.set_ylabel('Altitude Difference [m]')
                 ax2.set_title('Numeric - Plant Difference\n(Communication Delay Effect)')
                 ax2.grid(True, alpha=0.3)
-
+                
                 # Add statistics
                 mean_diff = np.mean(np.abs(trajectory_diff))
                 max_diff = np.max(np.abs(trajectory_diff))
-                ax2.text(0.05, 0.95, f'Mean |Diff|: {mean_diff:.3f}m\nMax |Diff|: {max_diff:.3f}m',
+                ax2.text(0.05, 0.95, f'Mean |Diff|: {mean_diff:.3f}m\nMax |Diff|: {max_diff:.3f}m', 
                         transform=ax2.transAxes, verticalalignment='top',
                         bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-            except ImportError:
-                ax2.text(0.5, 0.5, 'scipy not available for interpolation',
-                        transform=ax2.transAxes, ha='center', va='center')
-                ax2.set_title('Trajectory Difference Analysis')
+                        
             except Exception as e:
-                ax2.text(0.5, 0.5, f'Could not compute difference:\n{str(e)}',
+                ax2.text(0.5, 0.5, f'Could not compute difference:\n{str(e)}', 
                         transform=ax2.transAxes, ha='center', va='center')
                 ax2.set_title('Trajectory Difference Analysis')
-
+            
             # Phase portrait comparison
             ax3 = fig.add_subplot(gs[1, 1])
-
+            
             numeric_vel = self.numeric_data['velocity'].values
             plant_vel = self.plant_data['velocity'].values
-
-            ax3.plot(numeric_alt, numeric_vel, color='#1f77b4', linewidth=2,
+            
+            ax3.plot(numeric_alt, numeric_vel, color='#1f77b4', linewidth=2, 
                     alpha=0.7, label='Numeric')
-            ax3.plot(plant_alt, plant_vel, color='#ff7f0e', linewidth=2,
+            ax3.plot(plant_alt, plant_vel, color='#ff7f0e', linewidth=2, 
                     alpha=0.7, label='Plant')
             ax3.set_xlabel('Altitude [m]')
             ax3.set_ylabel('Velocity [m/s]')
             ax3.set_title('Phase Portrait Comparison')
             ax3.legend()
             ax3.grid(True, alpha=0.3)
-
+            
         else:
             # Single trajectory plot (fallback)
             ax = fig.add_subplot(111)
-
+            
             altitude = self.numeric_data['altitude'].values
-            t = self.numeric_data['t'].values
+            t = self.numeric_data['sim_time'].values
             setpoint = self.numeric_data['setpoint'].values[0]
-
+            
             ax.plot(t, altitude, linewidth=3, label='Numeric Altitude', color='blue')
-            ax.axhline(y=setpoint, color='red', linestyle='--', linewidth=2,
+            ax.axhline(y=setpoint, color='red', linestyle='--', linewidth=2, 
                       label=f'Target ({setpoint}m)')
-
+            
             # Mark important points
             ax.scatter([t[0]], [altitude[0]], color='green', s=150, marker='o', label='Start')
             ax.scatter([t[-1]], [altitude[-1]], color='red', s=150, marker='s', label='End')
-
+            
             ax.set_xlabel('Time [s]')
             ax.set_ylabel('Altitude [m]')
-            ax.set_title('Altitude Control Trajectory (Numeric Only)',
+            ax.set_title('Altitude Control Trajectory (Numeric Only)', 
                         fontsize=16, fontweight='bold')
             ax.legend()
             ax.grid(True, alpha=0.3)
-
+        
         return fig
-
+        
     def create_performance_report(self):
         """Create detailed performance analysis report"""
         fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         fig.suptitle('HILS Performance Analysis Report', fontsize=16, fontweight='bold')
-
-        t = self.numeric_data['t'].values
+        
+        t = self.numeric_data['sim_time'].values
         altitude = self.numeric_data['altitude'].values
-        fz = self.numeric_data['fz'].values  # thrust_cmd equivalent
+        thrust_cmd = self.numeric_data['thrust_cmd'].values
         velocity = self.numeric_data['velocity'].values
         altitude_error = self.numeric_data['altitude_error'].values
         rtt = self.numeric_data['rtt_ms'].values
-        setpoint = self.numeric_data['setpoint'].values[0]
-
+        
         # 1. Altitude tracking
         axes[0,0].plot(t, altitude, 'b-', linewidth=2, label='Actual')
-        axes[0,0].axhline(setpoint, color='r', linestyle='--', label='Target')
+        axes[0,0].axhline(10, color='r', linestyle='--', label='Target')
         axes[0,0].set_title('Altitude Tracking')
         axes[0,0].set_ylabel('Altitude [m]')
         axes[0,0].legend()
         axes[0,0].grid(True, alpha=0.3)
-
+        
         # 2. Control signal
-        axes[0,1].plot(t, fz, 'g-', linewidth=2)
+        axes[0,1].plot(t, thrust_cmd, 'g-', linewidth=2)
         axes[0,1].axhline(9.81, color='gray', linestyle=':', label='Gravity')
         axes[0,1].set_title('Control Signal')
         axes[0,1].set_ylabel('Thrust [N]')
         axes[0,1].legend()
         axes[0,1].grid(True, alpha=0.3)
-
+        
         # 3. Error histogram
         axes[0,2].hist(altitude_error, bins=30, alpha=0.7, color='orange', edgecolor='black')
         axes[0,2].axvline(0, color='red', linestyle='--')
@@ -512,7 +422,7 @@ class HILSAnalyzer:
         axes[0,2].set_xlabel('Error [m]')
         axes[0,2].set_ylabel('Frequency')
         axes[0,2].grid(True, alpha=0.3)
-
+        
         # 4. Velocity vs time
         axes[1,0].plot(t, velocity, 'purple', linewidth=2)
         axes[1,0].axhline(0, color='black', alpha=0.5)
@@ -520,47 +430,47 @@ class HILSAnalyzer:
         axes[1,0].set_xlabel('Time [s]')
         axes[1,0].set_ylabel('Velocity [m/s]')
         axes[1,0].grid(True, alpha=0.3)
-
+        
         # 5. RTT analysis
         axes[1,1].plot(t, rtt, 'cyan', linewidth=1, alpha=0.7)
         axes[1,1].set_title('Communication Latency')
         axes[1,1].set_xlabel('Time [s]')
         axes[1,1].set_ylabel('RTT [ms]')
         axes[1,1].grid(True, alpha=0.3)
-
+        
         # 6. Control performance metrics
         axes[1,2].axis('off')
-
+        
         # Calculate performance metrics
         settling_time = None
         steady_state_error = np.mean(np.abs(altitude_error[-100:]))  # Last 100 points
-        overshoot = np.max(altitude) - setpoint if np.max(altitude) > setpoint else 0
+        overshoot = np.max(altitude) - 10 if np.max(altitude) > 10 else 0
         rise_time = None
-
+        
         # Find rise time (10% to 90% of target)
-        target_10 = 0.1 * setpoint
-        target_90 = 0.9 * setpoint
+        target_10 = 0.1 * 10
+        target_90 = 0.9 * 10
         try:
             idx_10 = np.where(altitude >= target_10)[0][0]
             idx_90 = np.where(altitude >= target_90)[0][0]
             rise_time = t[idx_90] - t[idx_10]
         except:
             rise_time = None
-
+            
         # Find settling time (within 2% of target)
         try:
-            settling_band = 0.02 * setpoint  # 2% of setpoint
+            settling_band = 0.02 * 10  # 2% of 10m
             for i in range(len(altitude)-100, len(altitude)):
-                if abs(altitude[i:] - setpoint).max() <= settling_band:
+                if abs(altitude[i:] - 10).max() <= settling_band:
                     settling_time = t[i]
                     break
         except:
             settling_time = None
-
+            
         # Format time metrics safely
         rise_time_str = f"{rise_time:.3f} s" if rise_time is not None else "N/A"
         settling_time_str = f"{settling_time:.3f} s" if settling_time is not None else "N/A"
-
+        
         metrics_text = f"""Performance Metrics:
 
 Steady-state error: {steady_state_error:.3f} m
@@ -577,39 +487,30 @@ Simulation:
 Duration: {t[-1]:.2f} s
 Steps: {len(t)}
 Step rate: {len(t)/t[-1]:.0f} Hz"""
-
+        
         axes[1,2].text(0.05, 0.95, metrics_text, transform=axes[1,2].transAxes,
                       fontsize=10, verticalalignment='top', fontfamily='monospace')
-
+        
         plt.tight_layout()
         return fig
-
+        
     def generate_visualizations(self, plots=None, run_id=None):
         """Generate all requested visualizations"""
         if plots is None:
             plots = self.config['default_plots']
-
+            
         if not self.load_simulation_data(run_id=run_id):
             return False
-
+            
         generated_files = []
         dpi = self.config['visualization_dpi']
-
+        
         # Determine target directory
         if run_id:
-            # Find the actual session directory
-            target_dir = None
-            for date_dir in self.log_dir.iterdir():
-                if date_dir.is_dir() and self._is_date_directory(date_dir.name):
-                    for session_dir in date_dir.iterdir():
-                        if session_dir.is_dir() and run_id in session_dir.name:
-                            target_dir = session_dir
-                            break
-                    if target_dir:
-                        break
+            target_dir = self.log_dir / run_id
         else:
             target_dir = self.get_latest_run_dir()
-
+        
         if 'dashboard' in plots:
             print("Generating comprehensive dashboard...")
             fig = self.create_dashboard()
@@ -617,7 +518,7 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
             generated_files.append(str(filename))
             plt.close(fig)
-
+            
         if 'trajectory' in plots:
             if self.has_dual_trajectory:
                 print("Generating dual trajectory comparison (Plant vs Numeric)...")
@@ -628,7 +529,7 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
             generated_files.append(str(filename))
             plt.close(fig)
-
+            
         if 'performance' in plots:
             print("Generating performance report...")
             fig = self.create_performance_report()
@@ -636,183 +537,28 @@ Step rate: {len(t)/t[-1]:.0f} Hz"""
             fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
             generated_files.append(str(filename))
             plt.close(fig)
-
+            
         print(f"Generated {len(generated_files)} visualization files:")
         for filename in generated_files:
             print(f"  - {filename}")
-
+            
         return generated_files
-
-    def analyze_all_logs(self, limit: int = None, plots=None):
-        """Analyze all log sessions from most recent to oldest"""
-        print("=== ANALYZING ALL LOG SESSIONS ===")
-
-        all_runs = self.get_all_run_dirs(limit)
-
-        if not all_runs:
-            print("No log sessions found!")
-            return
-
-        print(f"Found {len(all_runs)} log sessions to analyze")
-        if limit:
-            print(f"Limited to most recent {limit} sessions")
-        print()
-
-        success_count = 0
-        error_count = 0
-
-        for i, run_dir in enumerate(all_runs, 1):
-            print(f"[{i}/{len(all_runs)}] Analyzing: {run_dir.name}")
-
-            try:
-                # Load data for this session
-                if not self.load_simulation_data_from_dir(run_dir):
-                    print(f"  ❌ Failed to load data from {run_dir.name}")
-                    error_count += 1
-                    continue
-
-                # Generate visualizations
-                generated_files = []
-                dpi = self.config['visualization_dpi']
-                target_plots = plots or self.config['default_plots']
-
-                if 'dashboard' in target_plots:
-                    print("  📊 Generating dashboard...")
-                    fig = self.create_dashboard()
-                    filename = run_dir / 'hils_analysis_dashboard.png'
-                    fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
-                    generated_files.append(str(filename))
-                    plt.close(fig)
-
-                if 'trajectory' in target_plots:
-                    print("  🛩️ Generating trajectory...")
-                    fig = self.create_trajectory_3d()
-                    filename = run_dir / 'hils_flight_trajectory.png'
-                    fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
-                    generated_files.append(str(filename))
-                    plt.close(fig)
-
-                if 'performance' in target_plots:
-                    print("  📈 Generating performance report...")
-                    fig = self.create_performance_report()
-                    filename = run_dir / 'hils_performance_report.png'
-                    fig.savefig(str(filename), dpi=dpi, bbox_inches='tight')
-                    generated_files.append(str(filename))
-                    plt.close(fig)
-
-                print(f"  ✅ Generated {len(generated_files)} files")
-                success_count += 1
-
-            except Exception as e:
-                print(f"  ❌ Error analyzing {run_dir.name}: {e}")
-                error_count += 1
-
-            print()  # Empty line between sessions
-
-        print("=== ANALYSIS SUMMARY ===")
-        print(f"Total sessions: {len(all_runs)}")
-        print(f"Successfully analyzed: {success_count}")
-        print(f"Errors: {error_count}")
-        print(f"Success rate: {success_count/len(all_runs)*100:.1f}%" if all_runs else "N/A")
-
-    def load_simulation_data_from_dir(self, run_dir: Path):
-        """Load simulation data from specific directory"""
-        numeric_file = run_dir / "numeric_log.csv"
-        plant_file = run_dir / "plant_log.csv"
-
-        if not numeric_file.exists():
-            return False
-
-        # Load numeric data (required)
-        try:
-            self.numeric_data = pd.read_csv(numeric_file)
-        except Exception as e:
-            print(f"    Error loading numeric data: {e}")
-            return False
-
-        # Load plant data (optional)
-        self.plant_data = None
-        if plant_file.exists():
-            try:
-                self.plant_data = pd.read_csv(plant_file)
-            except Exception as e:
-                print(f"    Warning: Could not load plant data: {e}")
-
-        # Check if we have both datasets for dual trajectory analysis
-        self.has_dual_trajectory = self.plant_data is not None
-
-        return True
-
-    def list_all_sessions(self, limit: int = 20):
-        """List all available log sessions"""
-        print("=== ALL LOG SESSIONS ===")
-
-        all_runs = self.get_all_run_dirs(limit)
-
-        if not all_runs:
-            print("No log sessions found!")
-            return
-
-        print(f"Found {len(all_runs)} sessions" + (f" (showing most recent {limit})" if limit else ""))
-        print()
-
-        for i, run_dir in enumerate(all_runs, 1):
-            # Get file info
-            numeric_log = run_dir / "numeric_log.csv"
-            plant_log = run_dir / "plant_log.csv"
-
-            # Get modification time
-            if numeric_log.exists():
-                mod_time = datetime.datetime.fromtimestamp(numeric_log.stat().st_mtime)
-            elif plant_log.exists():
-                mod_time = datetime.datetime.fromtimestamp(plant_log.stat().st_mtime)
-            else:
-                continue
-
-            # Check for existing visualizations
-            dashboard = run_dir / 'hils_analysis_dashboard.png'
-            trajectory = run_dir / 'hils_flight_trajectory.png'
-            performance = run_dir / 'hils_performance_report.png'
-
-            viz_status = []
-            if dashboard.exists():
-                viz_status.append("📊")
-            if trajectory.exists():
-                viz_status.append("🛩️")
-            if performance.exists():
-                viz_status.append("📈")
-
-            viz_str = "".join(viz_status) if viz_status else "❌"
-
-            # File sizes
-            numeric_size = f"{numeric_log.stat().st_size/1024:.1f}KB" if numeric_log.exists() else "❌"
-            plant_size = f"{plant_log.stat().st_size/1024:.1f}KB" if plant_log.exists() else "❌"
-
-            print(f"{i:2d}. {run_dir.name}")
-            print(f"    📅 {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"    📊 Numeric: {numeric_size}, Plant: {plant_size}")
-            print(f"    🎨 Visualizations: {viz_str}")
-            print()
-
+        
     def print_log_status(self):
         """Print current log status"""
         info = self.get_log_info()
-
+        
         print("\n" + "="*60)
         print("HILS LOG STATUS")
         print("="*60)
-
-        if not info:
-            print("No log files found in latest session")
-            return
-
+        
         for name, details in info.items():
             print(f"\n{name.upper()} LOG:")
             print(f"  File: {details['path']}")
             print(f"  Size: {details['size_mb']:.2f} MB")
             print(f"  Lines: {details['lines']}")
             print(f"  Modified: {details['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
-
+            
         print("="*60)
 
 def main():
@@ -822,59 +568,44 @@ def main():
         epilog="""
 Examples:
   %(prog)s status                 - Show log status
-  %(prog)s list                   - List all available log sessions
-  %(prog)s visualize             - Generate visualizations for latest session
-  %(prog)s visualize --run-id baseline - Analyze specific session containing 'baseline'
-  %(prog)s analyze-all           - Analyze all sessions (latest 10)
-  %(prog)s analyze-all --limit 5 - Analyze latest 5 sessions only
-  %(prog)s analyze-all --plots dashboard - Generate only dashboards for all
+  %(prog)s visualize             - Generate all visualizations
+  %(prog)s visualize --plots dashboard trajectory - Generate specific plots
+  %(prog)s visualize --run-id 20250903_211154 - Analyze specific run
   %(prog)s config --dpi 150      - Set visualization DPI to 150
         """
     )
-
+    
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
-
+    
     # Status command
     status_parser = subparsers.add_parser('status', help='Show log status')
-
+    
     # Visualize command
     viz_parser = subparsers.add_parser('visualize', help='Generate visualizations')
-    viz_parser.add_argument('--plots', nargs='+',
+    viz_parser.add_argument('--plots', nargs='+', 
                            choices=['dashboard', 'trajectory', 'performance'],
                            help='Specific plots to generate')
     viz_parser.add_argument('--show', action='store_true', help='Show plots after generation')
-    viz_parser.add_argument('--run-id', help='Specific run ID to analyze (e.g., baseline, fixed_delay)')
-
-    # Analyze All command
-    analyze_all_parser = subparsers.add_parser('analyze-all', help='Analyze all log sessions')
-    analyze_all_parser.add_argument('--limit', type=int, default=10,
-                                    help='Limit number of sessions to analyze (default: 10)')
-    analyze_all_parser.add_argument('--plots', nargs='+',
-                                   choices=['dashboard', 'trajectory', 'performance'],
-                                   help='Specific plots to generate')
-
-    # List Sessions command
-    list_parser = subparsers.add_parser('list', help='List all available log sessions')
-    list_parser.add_argument('--limit', type=int, default=20,
-                            help='Limit number of sessions to show (default: 20)')
-
+    viz_parser.add_argument('--run-id', help='Specific run ID to analyze (e.g., 20250903_211154)')
+    
+    
     # Config command
     config_parser = subparsers.add_parser('config', help='Manage configuration')
     config_parser.add_argument('--retention', type=int, help='Set log retention days')
     config_parser.add_argument('--dpi', type=int, help='Set visualization DPI')
     config_parser.add_argument('--show', action='store_true', help='Show current config')
-
+    
     args = parser.parse_args()
-
+    
     if not args.command:
         parser.print_help()
         return
-
+        
     analyzer = HILSAnalyzer()
-
+    
     if args.command == 'status':
         analyzer.print_log_status()
-
+        
     elif args.command == 'visualize':
         plots = args.plots if args.plots else None
         run_id = getattr(args, 'run_id', None)
@@ -887,16 +618,8 @@ Examples:
                         subprocess.run(['xdg-open', f], check=False)
                     except:
                         print(f"Generated: {f}")
-
-    elif args.command == 'analyze-all':
-        limit = getattr(args, 'limit', 10)
-        plots = getattr(args, 'plots', None)
-        analyzer.analyze_all_logs(limit=limit, plots=plots)
-
-    elif args.command == 'list':
-        limit = getattr(args, 'limit', 20)
-        analyzer.list_all_sessions(limit=limit)
-
+                        
+        
     elif args.command == 'config':
         if args.retention:
             analyzer.config['log_retention_days'] = args.retention

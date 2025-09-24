@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Plant シミュレーターメインファイル
+Plant シミュレーターメインファイル（新アーキテクチャ版）
 
+参考構造に基づくUDPサーバー実装。
 物理シミュレーション（高度制御対象）を実行し、
-Numeric側との通信を通信モジュールに委譲。
+Numeric側からのUDPリクエストに状態データで応答。
 
 主要機能：
 - SimpleAltitudePlant: 1次元高度物理モデル
-- 独立シミュレーションループ（固定周期実行）
-- 通信モジュールとの連携
+- UDP Echo Server: リクエスト・レスポンス通信
+- RTT測定・統計
 - ログ記録・分析
 """
 
+import socket
 import yaml
 import numpy as np
 import os
@@ -19,10 +21,11 @@ import sys
 import time
 import csv
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
-# 通信モジュールをインポート
-from plant_communication import PlantCommunicationManager
+# 新プロトコルをインポート
+sys.path.append('/app')
+from shared.protocol import ProtocolHandler, RequestPacket, ResponsePacket, create_response_packet
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -101,37 +104,37 @@ class SimpleAltitudePlant:
         )
 
 
-class PlantSimulator:
+class PlantServer:
     """
-    Plantシミュレーターメインクラス
+    Plant UDP サーバークラス（新アーキテクチャ版）
 
-    物理シミュレーションを実行し、通信モジュールを通じて
-    Numeric側とのデータ交換を行う。
+    参考構造に基づくUDPエコーサーバー実装。
+    Numeric側からのリクエストを受信し、
+    現在の物理シミュレーション状態を応答。
 
     主要機能：
-    - 独立したシミュレーションループ
-    - 通信モジュールとの連携
+    - UDP Echo Server（リクエスト・レスポンス）
+    - 物理シミュレーション（SimpleAltitudePlant）
+    - RTT測定・統計
     - ログ記録・分析
-    - 設定管理
     """
 
     def __init__(self, config_file: str = "config.yaml"):
         """
-        シミュレーター初期化
+        サーバー初期化
 
         Args:
             config_file: 設定ファイルパス（YAML形式）
         """
         self.load_config(config_file)       # 設定読み込み
-        self.setup_communication()          # 通信システム設定
         self.setup_simulation()             # 物理シミュレーション設定
         self.setup_logging()                # ログシステム設定
+        self.setup_udp_server()             # UDPサーバー設定
 
-        # ===== シミュレーション状態 =====
-        self.current_thrust = 0.0      # 現在の推力[N]
-        self.step_count = 0            # ステップカウンタ
-        self.sim_time = 0.0            # シミュレーション時刻[s]
-        self.max_steps = int(os.getenv('MAX_STEPS', 4000))  # 最大ステップ数
+        # ===== サーバー状態 =====
+        self.current_thrust = [0.0, 0.0, 0.0]  # 現在の推力[N] [fx, fy, fz]
+        self.request_count = 0             # リクエスト処理数
+        self.start_time = time.time()      # サーバー開始時刻
 
     def load_config(self, config_file: str):
         """
@@ -143,23 +146,35 @@ class PlantSimulator:
         with open(config_file, 'r') as f:
             self.config = yaml.safe_load(f)
 
-        # 環境変数による設定上書き（Docker環境での動的設定用）
-        self.bind_address = os.getenv('PLANT_BIND', self.config['plant']['bind_address'])
+        # UDPサーバー設定
+        self.host = os.getenv('PLANT_HOST', '0.0.0.0')  # バインドアドレス
+        self.port = int(os.getenv('PLANT_PORT', 5005))  # UDPポート
         self.dt = float(os.getenv('STEP_DT', self.config['plant']['dt']))  # シミュレーション周期[s]
 
-        # タイムスタンプ付きログディレクトリ作成
-        run_id = os.getenv('RUN_ID', time.strftime('%Y%m%d_%H%M%S'))
-        log_dir = f"/app/logs/{run_id}"
+        # 新しい日付ベースログディレクトリ設定
+        log_date_dir = os.getenv('LOG_DATE_DIR')
+        log_description = os.getenv('LOG_DESCRIPTION', 'test')
+
+        if log_date_dir:
+            # 環境変数からのパス（Docker内）
+            log_dir = f"/app/logs/{log_date_dir}"
+        else:
+            # フォールバック: 従来形式
+            date_str = time.strftime('%Y-%m-%d')
+            time_str = time.strftime('%H%M%S')
+            log_dir = f"/app/logs/{date_str}/{time_str}_{log_description}"
+
+        print(f"Plant log directory: {log_dir}")
+        os.makedirs(log_dir, exist_ok=True)
         self.log_file = f"{log_dir}/plant_log.csv"
 
-    def setup_communication(self):
+    def setup_udp_server(self):
         """
-        通信システムセットアップ
-
-        通信モジュールを使用してNumeric側との通信を初期化
+        UDPサーバーセットアップ
         """
-        self.comm_manager = PlantCommunicationManager(self.config)
-        self.communicator = self.comm_manager.setup_communication()
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind((self.host, self.port))
+        logger.info(f"Plant UDP server bound to {self.host}:{self.port}")
 
     def setup_simulation(self):
         """
@@ -193,143 +208,152 @@ class PlantSimulator:
         self.log_fp = open(self.log_file, 'w', newline='')
         self.csv_writer = csv.writer(self.log_fp)
 
-        # CSVヘッダー（分析用データ）
-        self.csv_writer.writerow(['seq', 't', 'recv_time', 'send_time', 'thrust',
-                                 'altitude', 'velocity', 'acceleration',
-                                 'step_start_sync', 'step_start_wall', 'sync_base_time'])
+        # CSVヘッダー（新アーキテクチャ版）
+        self.csv_writer.writerow(['seq', 'recv_time', 'send_time', 'rtt_ms',
+                                 'fx', 'fy', 'fz', 'altitude', 'velocity', 'acceleration',
+                                 'client_addr', 'packet_size'])
 
-    def get_state_data(self) -> Dict:
+    def get_current_state(self) -> Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]:
         """
-        現在の状態データを構築
+        現在の物理状態を取得
 
         Returns:
-            標準的なセンサーデータフォーマットの状態辞書
+            (position, velocity, acceleration) タプル
         """
-        return {
-            "acc": [0.0, 0.0, self.plant.acceleration + np.random.normal(0, 0.01)],  # Z軸加速度計
-            "gyro": [0.0, 0.0, 0.0],                                                 # 回転なし
-            "position": [0.0, 0.0, self.plant.position],                           # 高度のみ
-            "velocity": [0.0, 0.0, self.plant.velocity]                            # Z軸速度のみ
-        }
+        # センサーノイズを追加
+        pos_noise = np.random.normal(0, 0.005)
+        vel_noise = np.random.normal(0, 0.005)
+        acc_noise = np.random.normal(0, 0.01)
 
-    def wait_for_synchronization(self):
-        """
-        Numeric側からの同期プロトコル待機
+        position = (0.0, 0.0, self.plant.position + pos_noise)
+        velocity = (0.0, 0.0, self.plant.velocity + vel_noise)
+        acceleration = (0.0, 0.0, self.plant.acceleration + acc_noise)
 
-        通信モジュールの同期機能を使用
+        return position, velocity, acceleration
+
+    def process_request(self, data: bytes, addr: Tuple[str, int]) -> Optional[bytes]:
         """
-        self.communicator.wait_for_synchronization()
+        リクエストパケット処理
+
+        Args:
+            data: 受信データ
+            addr: クライアントアドレス
+
+        Returns:
+            応答データ or None（エラー時）
+        """
+        # リクエストパケット解析
+        request = ProtocolHandler.unpack_request(data)
+        if not request:
+            logger.warning(f"Invalid packet from {addr}")
+            return None
+
+        # 制御入力を物理シミュレーションに適用
+        self.current_thrust = [request.fx, request.fy, request.fz]
+
+        # 物理シミュレーション更新
+        self.plant.update(request.fz, self.dt)
+
+        # 現在の状態を取得
+        position, velocity, acceleration = self.get_current_state()
+
+        # 応答パケット生成
+        response = create_response_packet(
+            request.sequence_number, position, velocity, acceleration
+        )
+
+        # バイナリパケットにパック
+        return ProtocolHandler.pack_response(response)
 
     def run(self):
         """
-        独立シミュレーションループメイン実行
+        UDP エコーサーバーメイン実行
 
-        固定周期でPlant物理シミュレーションを実行し、
-        通信モジュールを通じてNumeric側とデータ交換。
+        参考構造に基づくリクエスト・レスポンス方式。
+        Numeric側からのUDPリクエストを受信し、
+        現在の物理状態を応答として返す。
 
         実行フロー：
-        1. 同期プロトコル実行
-        2. 固定周期ループ開始
-        3. 遅延コマンド処理
-        4. 新コマンド受信
-        5. 物理更新
-        6. 状態配信
-        7. ログ記録
+        1. UDPリクエスト受信待機
+        2. リクエストパケット解析
+        3. 制御入力適用・物理更新
+        4. 状態データ応答
+        5. ログ記録
         """
-        logger.info(f"Plant independent simulation started: {self.max_steps} steps at {1/self.dt:.0f} Hz")
+        logger.info(f"Plant UDP server started on {self.host}:{self.port}")
+        logger.info(f"Physics simulation: dt={self.dt}s")
 
-        # ===== 1. Numeric側との同期プロトコル実行 =====
-        self.wait_for_synchronization()
-
-        # シミュレーション再初期化（同期後に状態リセット）
+        # 物理シミュレーション初期化
         sim_config = self.config['simulation']
         initial_position = float(sim_config['initial_position'])
         initial_velocity = float(sim_config['initial_velocity'])
         self.plant.reset(initial_position, initial_velocity)
 
         try:
-            start_time = time.perf_counter()
+            while True:
+                # ===== UDPリクエスト受信 =====
+                data, addr = self.socket.recvfrom(1024)  # 最大1KB
+                recv_time = time.time()
 
-            # ===== 2. 固定周期メインループ =====
-            for step in range(self.max_steps):
-                step_start = time.perf_counter()
-                step_start_sync = self.communicator.get_sync_timestamp()
-                step_start_wall = time.time()
+                # ===== リクエスト処理・応答生成 =====
+                response_data = self.process_request(data, addr)
 
-                self.step_count = step
-                self.sim_time = step * self.dt
+                if response_data:
+                    # ===== レスポンス送信 =====
+                    send_time = time.time()
+                    self.socket.sendto(response_data, addr)
+                    rtt_ms = (send_time - recv_time) * 1000
 
-                # ===== 3. 遅延コマンド処理（遅延シミュレーション有効時）=====
-                delayed_command = self.communicator.process_delayed_commands()
-                if delayed_command is not None:
-                    self.current_thrust = delayed_command[2] if len(delayed_command) >= 3 else 0.0
+                    self.request_count += 1
 
-                # ===== 4. 新コマンド受信（ノンブロッキング）=====
-                new_command = self.communicator.receive_commands()
-                if new_command is not None:
-                    self.current_thrust = new_command[2] if len(new_command) >= 3 else 0.0
+                    # ===== ログ記録 =====
+                    if self.csv_writer:
+                        request = ProtocolHandler.unpack_request(data)
+                        if request:
+                            position, velocity, acceleration = self.get_current_state()
+                            self.csv_writer.writerow([
+                                request.sequence_number, recv_time, send_time, rtt_ms,
+                                request.fx, request.fy, request.fz,
+                                position[2], velocity[2], acceleration[2],  # Z軸のみ
+                                f"{addr[0]}:{addr[1]}", len(data)
+                            ])
+                            self.log_fp.flush()
 
-                # ===== 5. 物理モデル更新 =====
-                position, velocity, acceleration = self.plant.update(self.current_thrust, self.dt)
-
-                # ===== 6. 状態データをNumeric側に配信 =====
-                state_data = self.get_state_data()
-                self.communicator.broadcast_state(step, self.sim_time, state_data)
-
-                # ===== 7. ログ記録 =====
-                if self.csv_writer:
-                    current_time = time.time()
-                    self.csv_writer.writerow([
-                        step, self.sim_time, current_time, current_time,
-                        self.current_thrust, position, velocity, acceleration,
-                        step_start_sync, step_start_wall, self.communicator.sync_base_time
-                    ])
-                    self.log_fp.flush()
-
-                # 進捗表示（500ステップ毎）
-                if (step + 1) % 500 == 0:
-                    logger.info(f"Plant step {step + 1}/{self.max_steps}, Alt: {position:.2f}m, Thrust: {self.current_thrust:.1f}N")
-
-                # ===== 固定周期制御：次ステップまで待機 =====
-                elapsed = time.perf_counter() - step_start
-                sleep_time = self.dt - elapsed
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                    # 進捗表示（100リクエスト毎）
+                    if self.request_count % 100 == 0:
+                        uptime = time.time() - self.start_time
+                        rate = self.request_count / uptime if uptime > 0 else 0
+                        logger.info(f"Plant processed {self.request_count} requests, Rate: {rate:.1f} req/s, Alt: {self.plant.position:.2f}m")
                 else:
-                    # 周期を逃した場合の警告
-                    logger.warning(f"Plant missed timestep by {-sleep_time*1000:.1f}ms at step {step}")
-
-            # ===== 実行結果統計 =====
-            total_time = time.perf_counter() - start_time
-            logger.info(f"Plant simulation completed: {self.max_steps} steps in {total_time:.2f}s")
-            logger.info(f"Average step time: {total_time/self.max_steps*1000:.1f}ms")
+                    logger.warning(f"Failed to process request from {addr}")
 
         except KeyboardInterrupt:
-            logger.info("Plant simulation interrupted")
+            logger.info("Plant server interrupted")
         except Exception as e:
-            logger.error(f"Error in plant simulation: {e}")
+            logger.error(f"Error in plant server: {e}")
         finally:
             self.cleanup()
 
     def cleanup(self):
         """
         リソース解放・クリーンアップ
-
-        ログファイルと通信リソースを適切に終了
         """
         if hasattr(self, 'csv_writer') and self.csv_writer:
             self.log_fp.close()
-        if hasattr(self, 'comm_manager'):
-            self.comm_manager.cleanup()
-        logger.info("Plant simulator stopped")
+        if hasattr(self, 'socket'):
+            self.socket.close()
+
+        # 統計表示
+        uptime = time.time() - self.start_time
+        rate = self.request_count / uptime if uptime > 0 else 0
+        logger.info(f"Plant server stopped: {self.request_count} requests in {uptime:.1f}s ({rate:.1f} req/s)")
 
 
 if __name__ == "__main__":
     """
     メインエントリポイント
 
-    スクリプトが直接実行された場合のみPlantシミュレーターを起動
-    Docker環境では config.yaml 設定を使用して実行される
+    新アーキテクチャ版：UDP Echo Serverとして動作
     """
-    simulator = PlantSimulator()  # シミュレーター初期化
-    simulator.run()               # シミュレーション開始
+    server = PlantServer()  # サーバー初期化
+    server.run()           # サーバー開始

@@ -1,0 +1,17 @@
+numeric:
+  plant_endpoint: "tcp://plant:5555"
+  dt: 0.01
+  max_steps: 4000  # 20 second long test
+  timeout_ms: 5000
+  log_file: "/app/logs/numeric_log.csv"
+
+controller:
+  type: "pid"
+  kp: 8.0      # More aggressive gain to see delay effects
+  ki: 1.0      # Higher integral to test stability with delays
+  kd: 3.0      # Higher derivative for faster response
+  setpoint: 10.0  # Target altitude [m]
+
+scenario:
+  file: "/app/shared/scenarios/default.csv"
+  enabled: false  # Use PID mode for simplified altitude control

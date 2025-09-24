@@ -1,0 +1,194 @@
+version: '3.8'
+
+services:
+  # Test 1: No delay (baseline)
+  server-baseline:
+    build: ./server
+    container_name: delay-server-baseline
+    networks:
+      - delay-test-net
+    ports:
+      - "5560:5555"
+    command: python delay_server.py --port 5555
+    profiles: ["baseline"]
+
+  client-baseline:
+    build: ./client
+    container_name: delay-client-baseline
+    depends_on:
+      - server-baseline
+    networks:
+      - delay-test-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-baseline:5555
+      - SAMPLES=300
+      - TEST_NAME=baseline_no_delay
+    volumes:
+      - ./results:/app
+    command: python enhanced_client.py
+    profiles: ["baseline"]
+
+  # Test 2: Fixed delay (10ms processing + 20ms network)
+  server-fixed-delay:
+    build: ./server
+    container_name: delay-server-fixed
+    networks:
+      - delay-test-net
+    ports:
+      - "5561:5555"
+    environment:
+      - DELAY_BASE_MS=10.0
+      - DELAY_NETWORK_MS=20.0
+      - DELAY_JITTER_MS=0.0
+    command: python delay_server.py
+    profiles: ["fixed"]
+
+  client-fixed-delay:
+    build: ./client
+    container_name: delay-client-fixed
+    depends_on:
+      - server-fixed-delay
+    networks:
+      - delay-test-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-fixed-delay:5555
+      - SAMPLES=300
+      - TEST_NAME=fixed_delay_30ms
+    volumes:
+      - ./results:/app
+    command: python enhanced_client.py
+    profiles: ["fixed"]
+
+  # Test 3: Variable delay with jitter (50ms ± 10ms uniform)
+  server-jitter-uniform:
+    build: ./server
+    container_name: delay-server-jitter-uniform
+    networks:
+      - delay-test-net
+    ports:
+      - "5562:5555"
+    environment:
+      - DELAY_BASE_MS=25.0
+      - DELAY_NETWORK_MS=25.0
+      - DELAY_JITTER_MS=10.0
+      - DELAY_JITTER_TYPE=uniform
+    command: python delay_server.py
+    profiles: ["jitter-uniform"]
+
+  client-jitter-uniform:
+    build: ./client
+    container_name: delay-client-jitter-uniform
+    depends_on:
+      - server-jitter-uniform
+    networks:
+      - delay-test-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-jitter-uniform:5555
+      - SAMPLES=500
+      - TEST_NAME=jitter_uniform_50ms_10ms
+    volumes:
+      - ./results:/app
+    command: python enhanced_client.py
+    profiles: ["jitter-uniform"]
+
+  # Test 4: Gaussian jitter (50ms ± 15ms gaussian)
+  server-jitter-gaussian:
+    build: ./server
+    container_name: delay-server-jitter-gaussian
+    networks:
+      - delay-test-net
+    ports:
+      - "5563:5555"
+    environment:
+      - DELAY_BASE_MS=25.0
+      - DELAY_NETWORK_MS=25.0
+      - DELAY_JITTER_MS=15.0
+      - DELAY_JITTER_TYPE=gaussian
+    command: python delay_server.py
+    profiles: ["jitter-gaussian"]
+
+  client-jitter-gaussian:
+    build: ./client
+    container_name: delay-client-jitter-gaussian
+    depends_on:
+      - server-jitter-gaussian
+    networks:
+      - delay-test-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-jitter-gaussian:5555
+      - SAMPLES=500
+      - TEST_NAME=jitter_gaussian_50ms_15ms
+    volumes:
+      - ./results:/app
+    command: python enhanced_client.py
+    profiles: ["jitter-gaussian"]
+
+  # Test 5: Exponential jitter (asymmetric)
+  server-jitter-exponential:
+    build: ./server
+    container_name: delay-server-jitter-exponential
+    networks:
+      - delay-test-net
+    ports:
+      - "5564:5555"
+    environment:
+      - DELAY_BASE_MS=30.0
+      - DELAY_NETWORK_MS=20.0
+      - DELAY_JITTER_MS=25.0
+      - DELAY_JITTER_TYPE=exponential
+    command: python delay_server.py
+    profiles: ["jitter-exponential"]
+
+  client-jitter-exponential:
+    build: ./client
+    container_name: delay-client-jitter-exponential
+    depends_on:
+      - server-jitter-exponential
+    networks:
+      - delay-test-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-jitter-exponential:5555
+      - SAMPLES=500
+      - TEST_NAME=jitter_exponential_50ms_25ms
+    volumes:
+      - ./results:/app
+    command: python enhanced_client.py
+    profiles: ["jitter-exponential"]
+
+  # Test 6: High jitter test (simulates poor network conditions)
+  server-high-jitter:
+    build: ./server
+    container_name: delay-server-high-jitter
+    networks:
+      - delay-test-net
+    ports:
+      - "5565:5555"
+    environment:
+      - DELAY_BASE_MS=10.0
+      - DELAY_NETWORK_MS=40.0
+      - DELAY_JITTER_MS=30.0
+      - DELAY_JITTER_TYPE=uniform
+    command: python delay_server.py
+    profiles: ["high-jitter"]
+
+  client-high-jitter:
+    build: ./client
+    container_name: delay-client-high-jitter
+    depends_on:
+      - server-high-jitter
+    networks:
+      - delay-test-net
+    environment:
+      - SERVER_ENDPOINT=tcp://server-high-jitter:5555
+      - SAMPLES=500
+      - TEST_NAME=high_jitter_50ms_30ms
+    volumes:
+      - ./results:/app
+    command: python enhanced_client.py
+    profiles: ["high-jitter"]
+
+networks:
+  delay-test-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1500

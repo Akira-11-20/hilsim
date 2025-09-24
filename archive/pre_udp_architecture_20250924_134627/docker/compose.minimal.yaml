@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  minimal-plant:
+    build: ../plant
+    container_name: minimal-plant
+    networks:
+      - minimal-net
+    command: python minimal_plant.py
+
+  minimal-numeric:
+    build: ../numeric
+    container_name: minimal-numeric
+    depends_on:
+      - minimal-plant
+    networks:
+      - minimal-net
+    command: python minimal_numeric.py
+
+networks:
+  minimal-net:
+    driver: bridge

@@ -1,0 +1,252 @@
+version: '3.8'
+
+# 遅延制御テスト用Docker Compose設定
+# 参考構造に基づいたネットワーク遅延シミュレーション
+
+services:
+  # Test 1: ベースライン（遅延なし）
+  plant-baseline:
+    build: ./plant
+    container_name: hils-plant-baseline
+    networks:
+      - delay-test-net
+    ports:
+      - "5100:5005/udp"
+    environment:
+      - PLANT_HOST=0.0.0.0
+      - PLANT_PORT=5005
+      - STEP_DT=0.02
+      - RUN_ID=baseline
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    profiles: ["baseline"]
+
+  numeric-baseline:
+    build: ./numeric
+    container_name: hils-numeric-baseline
+    depends_on:
+      - plant-baseline
+    networks:
+      - delay-test-net
+    environment:
+      - PLANT_HOST=plant-baseline
+      - PLANT_PORT=5005
+      - TIMEOUT_S=1.0
+      - MAX_STEPS=1000
+      - RATE_HZ=50
+      - RUN_ID=baseline
+      - KP=18.0
+      - KI=5.0
+      - KD=8.0
+      - SETPOINT=10.0
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    profiles: ["baseline"]
+
+  # Test 2: 固定遅延（15ms基本 + 5msジッタ）
+  plant-fixed-delay:
+    build: ./plant
+    container_name: hils-plant-fixed-delay
+    networks:
+      - delay-test-net
+    ports:
+      - "5101:5005/udp"
+    environment:
+      - PLANT_HOST=0.0.0.0
+      - PLANT_PORT=5005
+      - STEP_DT=0.02
+      - RUN_ID=fixed_delay
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+      tc qdisc add dev eth0 root netem delay 15ms 5ms &&
+      python main.py
+      "
+    profiles: ["fixed-delay"]
+
+  numeric-fixed-delay:
+    build: ./numeric
+    container_name: hils-numeric-fixed-delay
+    depends_on:
+      - plant-fixed-delay
+    networks:
+      - delay-test-net
+    environment:
+      - PLANT_HOST=plant-fixed-delay
+      - PLANT_PORT=5005
+      - TIMEOUT_S=1.0
+      - MAX_STEPS=1000
+      - RATE_HZ=50
+      - RUN_ID=fixed_delay
+      - KP=18.0
+      - KI=5.0
+      - KD=8.0
+      - SETPOINT=10.0
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    profiles: ["fixed-delay"]
+
+  # Test 3: 高ジッタ（50ms ± 20ms）
+  plant-high-jitter:
+    build: ./plant
+    container_name: hils-plant-high-jitter
+    networks:
+      - delay-test-net
+    ports:
+      - "5102:5005/udp"
+    environment:
+      - PLANT_HOST=0.0.0.0
+      - PLANT_PORT=5005
+      - STEP_DT=0.02
+      - RUN_ID=high_jitter
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+      tc qdisc add dev eth0 root netem delay 50ms 20ms distribution normal &&
+      python main.py
+      "
+    profiles: ["high-jitter"]
+
+  numeric-high-jitter:
+    build: ./numeric
+    container_name: hils-numeric-high-jitter
+    depends_on:
+      - plant-high-jitter
+    networks:
+      - delay-test-net
+    environment:
+      - PLANT_HOST=plant-high-jitter
+      - PLANT_PORT=5005
+      - TIMEOUT_S=2.0  # Longer timeout for high jitter
+      - MAX_STEPS=1000
+      - RATE_HZ=20     # Lower rate for stability
+      - RUN_ID=high_jitter
+      - KP=18.0
+      - KI=5.0
+      - KD=8.0
+      - SETPOINT=10.0
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    profiles: ["high-jitter"]
+
+  # Test 4: パケット損失テスト（1%損失）
+  plant-packet-loss:
+    build: ./plant
+    container_name: hils-plant-packet-loss
+    networks:
+      - delay-test-net
+    ports:
+      - "5103:5005/udp"
+    environment:
+      - PLANT_HOST=0.0.0.0
+      - PLANT_PORT=5005
+      - STEP_DT=0.02
+      - RUN_ID=packet_loss
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+      tc qdisc add dev eth0 root netem delay 10ms 2ms loss 1% &&
+      python main.py
+      "
+    profiles: ["packet-loss"]
+
+  numeric-packet-loss:
+    build: ./numeric
+    container_name: hils-numeric-packet-loss
+    depends_on:
+      - plant-packet-loss
+    networks:
+      - delay-test-net
+    environment:
+      - PLANT_HOST=plant-packet-loss
+      - PLANT_PORT=5005
+      - TIMEOUT_S=1.0
+      - MAX_STEPS=1000
+      - RATE_HZ=50
+      - RUN_ID=packet_loss
+      - KP=18.0
+      - KI=5.0
+      - KD=8.0
+      - SETPOINT=10.0
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    profiles: ["packet-loss"]
+
+  # Test 5: 帯域制限テスト（1Mbps制限）
+  plant-bandwidth-limit:
+    build: ./plant
+    container_name: hils-plant-bandwidth-limit
+    networks:
+      - delay-test-net
+    ports:
+      - "5104:5005/udp"
+    environment:
+      - PLANT_HOST=0.0.0.0
+      - PLANT_PORT=5005
+      - STEP_DT=0.02
+      - RUN_ID=bandwidth_limit
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    cap_add:
+      - NET_ADMIN
+    command: >
+      sh -c "
+      tc qdisc add dev eth0 root handle 1: tbf rate 1mbit burst 32kbit latency 400ms &&
+      python main.py
+      "
+    profiles: ["bandwidth-limit"]
+
+  numeric-bandwidth-limit:
+    build: ./numeric
+    container_name: hils-numeric-bandwidth-limit
+    depends_on:
+      - plant-bandwidth-limit
+    networks:
+      - delay-test-net
+    environment:
+      - PLANT_HOST=plant-bandwidth-limit
+      - PLANT_PORT=5005
+      - TIMEOUT_S=1.0
+      - MAX_STEPS=1000
+      - RATE_HZ=50
+      - RUN_ID=bandwidth_limit
+      - KP=18.0
+      - KI=5.0
+      - KD=8.0
+      - SETPOINT=10.0
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    profiles: ["bandwidth-limit"]
+
+networks:
+  delay-test-net:
+    driver: bridge
+    name: hils-delay-test
+    driver_opts:
+      com.docker.network.driver.mtu: "1500"
+
+# Usage examples:
+# docker-compose -f docker-compose.delay.yml --profile baseline up
+# docker-compose -f docker-compose.delay.yml --profile fixed-delay up
+# docker-compose -f docker-compose.delay.yml --profile high-jitter up
+# docker-compose -f docker-compose.delay.yml --profile packet-loss up
+# docker-compose -f docker-compose.delay.yml --profile bandwidth-limit up

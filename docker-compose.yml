@@ -1,0 +1,68 @@
+
+services:
+  # Plant Server (UDP Server - Hardware側のシミュレーション)
+  plant:
+    build: ./plant
+    container_name: hils-plant
+    user: "1000:1000"
+    networks:
+      - hilsnet
+    ports:
+      - "${PLANT_PORT:-5005}:5005/udp"  # UDP port for Plant server
+    environment:
+      - PLANT_HOST=0.0.0.0
+      - PLANT_PORT=5005
+      - STEP_DT=${STEP_DT:-0.02}      # 50Hz default
+      - LOG_DATE_DIR=${LOG_DATE_DIR}
+      - LOG_DESCRIPTION=${LOG_DESCRIPTION:-test}
+      # Physics parameters
+      - MASS=${MASS:-1.0}
+      - GRAVITY=${GRAVITY:-9.81}
+      - INITIAL_POSITION=${INITIAL_POSITION:-0.0}
+      - INITIAL_VELOCITY=${INITIAL_VELOCITY:-0.0}
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('localhost', 5005)); s.close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Numeric Client (UDP Client - Control側のシミュレーション)
+  numeric:
+    build: ./numeric
+    container_name: hils-numeric
+    user: "1000:1000"
+    depends_on:
+      plant:
+        condition: service_healthy
+    networks:
+      - hilsnet
+    environment:
+      - PLANT_HOST=plant
+      - PLANT_PORT=5005
+      - TIMEOUT_S=${TIMEOUT_S:-1.0}
+      - STEP_DT=${STEP_DT:-0.02}      # 50Hz default
+      - MAX_STEPS=${MAX_STEPS:-2500}   # 50s at 50Hz
+      - RATE_HZ=${RATE_HZ:-50}        # Transmission rate
+      - LOG_DATE_DIR=${LOG_DATE_DIR}
+      - LOG_DESCRIPTION=${LOG_DESCRIPTION:-test}
+      # PID Controller parameters
+      - KP=${KP:-18.0}
+      - KI=${KI:-5.0}
+      - KD=${KD:-8.0}
+      - SETPOINT=${SETPOINT:-10.0}
+    volumes:
+      - ./logs:/app/logs
+      - ./shared:/app/shared:ro
+    restart: "no"
+
+networks:
+  hilsnet:
+    driver: bridge
+    name: hilsim-net
+    driver_opts:
+      com.docker.network.driver.mtu: "1500"
+      com.docker.network.bridge.enable_icc: "true"

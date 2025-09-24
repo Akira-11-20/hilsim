@@ -16,6 +16,7 @@ ZeroMQ PUB/SUBパターンを使用したNumeric→Plant間通信の実装。
 import zmq
 import time
 import logging
+import numpy as np
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -64,13 +65,16 @@ class NumericCommunicator:
         self.sync_base_time = None  # 同期基準時刻
         self.is_synchronized = False # 同期状態フラグ
 
-        # ===== RTT測定（同期タイムスタンプ使用）=====
-        self.command_timestamps = {}  # seq -> sync_timestamp マッピング
+        # ===== RTT測定（enhanced with high precision）=====
+        self.command_timestamps = {}  # seq -> (sync_timestamp, perf_counter) マッピング
+        self.rtt_history = []         # RTT履歴[ms]（最新1000件）
 
-        # ===== 通信統計 =====
+        # ===== 通信統計（enhanced） =====
         self.sent_count = 0       # 送信コマンド数
         self.received_count = 0   # 受信状態数
         self.timeout_count = 0    # タイムアウト数
+        self.rtt_measurements = []# RTT測定値[ms]
+        self.stats_interval = 100 # 統計表示間隔
 
         logger.info(f"NumericCommunicator setup: SUB from {plant_state_endpoint}, PUB on :{cmd_publish_port}")
 
@@ -179,7 +183,8 @@ class NumericCommunicator:
         if not self.is_synchronized:
             raise ValueError("Not synchronized - call establish_synchronization() first")
 
-        # 同期タイムスタンプ取得（RTT測定用）
+        # High precision timing for enhanced RTT measurement
+        send_perf_time = time.perf_counter()
         sync_timestamp = self.get_sync_timestamp()
 
         # 送信メッセージ構築
@@ -188,11 +193,12 @@ class NumericCommunicator:
             "t": sim_time,                       # シミュレーション時刻
             "u": command,                        # 制御入力 [fx, fy, fz]
             "sync_timestamp": sync_timestamp,    # 同期タイムスタンプ（RTT測定用）
+            "send_perf_time": send_perf_time,    # 高精度送信時刻
             "timestamp": time.time()             # 後方互換性のため保持
         }
 
-        # RTT計算用にタイムスタンプを保存
-        self.command_timestamps[seq] = sync_timestamp
+        # Enhanced RTT計算用にタイムスタンプを保存
+        self.command_timestamps[seq] = (sync_timestamp, send_perf_time)
 
         # 古いタイムスタンプを削除（メモリリーク防止、最新100個まで保持）
         if len(self.command_timestamps) > 100:
@@ -224,26 +230,25 @@ class NumericCommunicator:
                     state_msg = self.state_subscriber.recv_json(zmq.NOBLOCK)  # ノンブロッキング受信
                     recv_time = time.time()
 
-                    # ===== RTT計算（同期タイムスタンプ使用）=====
+                    # ===== Simple High-Precision RTT計算（communication_test_containersスタイル）=====
+                    recv_perf_time = time.perf_counter()
                     rtt_ms = 0.0
                     latest_cmd_seq = state_msg.get('latest_cmd_seq', -1)
 
-                    if self.is_synchronized and latest_cmd_seq in self.command_timestamps:
-                        # 同期タイムスタンプを使用した正確なRTT計算
-                        recv_sync_timestamp = self.get_sync_timestamp()
-                        send_sync_timestamp = self.command_timestamps[latest_cmd_seq]
-                        rtt_ms = (recv_sync_timestamp - send_sync_timestamp) * 1000
+                    # 高精度カウンターベースのRTT測定（最もシンプルで正確）
+                    if latest_cmd_seq in self.command_timestamps:
+                        _, send_perf_time = self.command_timestamps[latest_cmd_seq]
+                        rtt_ms = (recv_perf_time - send_perf_time) * 1000
 
-                        # 健全性チェック：同期タイムスタンプでは負のRTTは発生しないはず
-                        if rtt_ms < 0:
-                            logger.error(f"Negative RTT detected: {rtt_ms}ms - sync error for seq={latest_cmd_seq}")
+                        # 健全性チェック：合理的範囲内かつ正の値
+                        if 0 <= rtt_ms <= 10000:  # 0-10秒の範囲内
+                            # RTT履歴更新
+                            self.rtt_history.append(rtt_ms)
+                            if len(self.rtt_history) > 1000:  # 最新1000件保持
+                                self.rtt_history = self.rtt_history[-500:]
+                        else:
+                            # 異常値の場合はRTTを0にセット
                             rtt_ms = 0.0
-                    elif not self.is_synchronized:
-                        # 同期していない場合の従来方式（後方互換性）
-                        latest_cmd_timestamp = state_msg.get('latest_cmd_timestamp', 0)
-                        if latest_cmd_seq in self.command_timestamps:
-                            send_time = self.command_timestamps[latest_cmd_seq]
-                            rtt_ms = (recv_time - send_time) * 1000
 
                     # 状態データを構造化して保存
                     self.latest_state = {
@@ -255,6 +260,11 @@ class NumericCommunicator:
                         'valid': state_msg.get('valid', False)         # データ有効性フラグ
                     }
                     self.received_count += 1
+
+                    # 定期的統計表示
+                    if self.received_count % self.stats_interval == 0:
+                        self.print_rtt_statistics()
+
                 except zmq.Again:
                     # 受信待ちメッセージなし→ループ終了
                     break
@@ -263,6 +273,19 @@ class NumericCommunicator:
 
         return self.latest_state
 
+    def print_rtt_statistics(self):
+        """RTT統計表示（communication_test_containersスタイル）"""
+        if len(self.rtt_history) > 0:
+            recent_rtts = self.rtt_history[-self.stats_interval:]
+            avg_rtt = np.mean(recent_rtts)
+            std_rtt = np.std(recent_rtts)
+            min_rtt = np.min(recent_rtts)
+            max_rtt = np.max(recent_rtts)
+            p95_rtt = np.percentile(recent_rtts, 95) if len(recent_rtts) >= 20 else max_rtt
+
+            logger.info(f"Numeric RTT stats (last {len(recent_rtts)}): "
+                       f"{avg_rtt:.2f}±{std_rtt:.2f}ms [{min_rtt:.2f}-{max_rtt:.2f}ms] P95={p95_rtt:.2f}ms")
+
     def get_communication_stats(self) -> Dict:
         """
         通信統計を取得
@@ -270,12 +293,25 @@ class NumericCommunicator:
         Returns:
             通信統計辞書（送信数、受信数、タイムアウト数）
         """
-        return {
+        stats = {
             'sent_count': self.sent_count,
             'received_count': self.received_count,
             'timeout_count': self.timeout_count,
             'is_synchronized': self.is_synchronized
         }
+
+        # Enhanced RTT統計
+        if len(self.rtt_history) > 0:
+            stats.update({
+                'rtt_mean_ms': float(np.mean(self.rtt_history)),
+                'rtt_std_ms': float(np.std(self.rtt_history)),
+                'rtt_min_ms': float(np.min(self.rtt_history)),
+                'rtt_max_ms': float(np.max(self.rtt_history)),
+                'rtt_p95_ms': float(np.percentile(self.rtt_history, 95)) if len(self.rtt_history) >= 20 else 0.0,
+                'rtt_sample_count': len(self.rtt_history)
+            })
+
+        return stats
 
 
 class NumericCommunicationManager:
